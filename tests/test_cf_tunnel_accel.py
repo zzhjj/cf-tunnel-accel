@@ -178,5 +178,34 @@ class ZoneDiscoveryTests(unittest.TestCase):
             self.assertEqual(mod.print_domains(offline=True), 0)
         finally:
             mod.api = original
+
+
+class MissingConfigTests(unittest.TestCase):
+    """隧道配置缺失（新服务器常见）时不能抛 FileNotFoundError。"""
+
+    def setUp(self):
+        self._original = mod.CONFIG_PATH
+        mod.CONFIG_PATH = Path(tempfile.gettempdir()) / "cfa-not-exist-9f8a.yml"
+        if mod.CONFIG_PATH.exists():
+            mod.CONFIG_PATH.unlink()
+
+    def tearDown(self):
+        mod.CONFIG_PATH = self._original
+
+    def test_read_config_text_returns_empty_string(self):
+        self.assertEqual(mod.read_config_text(), "")
+
+    def test_missing_hint_mentions_path_and_fixes(self):
+        hint = mod.config_missing_hint()
+        self.assertIn(str(mod.CONFIG_PATH), hint)
+        self.assertIn("CF_TUNNEL_ACCEL_CONFIG", hint)
+        self.assertIn("--service", hint)
+
+    def test_health_check_fails_gracefully(self):
+        self.assertFalse(mod.health_check())
+
+    def test_upsert_tunnel_hostname_raises_cf_error(self):
+        with self.assertRaises(mod.CFError):
+            mod.upsert_tunnel_hostname("x.example.com", "http://127.0.0.1:1")
 if __name__ == "__main__":
     unittest.main(verbosity=2)

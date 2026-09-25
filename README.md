@@ -183,3 +183,8 @@ CF_TUNNEL_ACCEL_SCRIPT=/path/to/script python3 tests/test_cf_tunnel_accel.py
 - `找不到域名 X 所属 Cloudflare zone` → 该域名不在本账号，用 `add ... --external` 走手动解析。
 - 新增时报「找不到 SaaS 自定义主机名」→ 辅助域未配置 fallback origin，检查 `health` 输出里的 `SaaS fallback origin` 一行。
 - 访问 502 → `health <域名> --https` 看是本地后端没起，还是 SaaS/证书未 active。
+- `隧道配置不存在: /root/.cloudflared/config-home.yml`（新服务器上跑菜单 2/3/4 最常遇到）→ 这台机器还没有隧道配置。三种处理：
+  1. 这台机器要跑隧道：`cloudflared tunnel login && cloudflared tunnel create <名字>` 后执行 `./install.sh --service`，install.sh 会自动生成配置和 systemd 服务；
+  2. 配置放在别处：`export CF_TUNNEL_ACCEL_CONFIG=/实际/路径.yml`（写进 `~/.config/cf-tunnel-accel/env` 可永久生效）；
+  3. 只想看云端信息：`list`/`status`/`health` 会跳过本地隧道部分，SaaS 与 DNS 依旧会显示。
+  `add` 在配置缺失时会**直接失败且不改动云端**，属于预期行为。

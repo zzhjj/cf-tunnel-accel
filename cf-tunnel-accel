@@ -1372,6 +1372,25 @@ def backup_config() -> Path:
     return bak
 
 
+def read_config_text() -> str:
+    """读隧道配置文本；文件不存在返回空串，避免新机器上直接抛 FileNotFoundError。"""
+    try:
+        return CONFIG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        raise CFError(f"读取隧道配置失败 {CONFIG_PATH}: {exc}") from None
+
+
+def config_missing_hint() -> str:
+    """隧道配置缺失时的统一提示（新服务器上最常见）。"""
+    return (
+        f"隧道配置不存在: {CONFIG_PATH}\n"
+        "  - 本机已有隧道: ./install.sh --service   （自动生成配置 + systemd 服务）\n"
+        "  - 配置在别处:   export CF_TUNNEL_ACCEL_CONFIG=/实际/路径.yml\n"
+        "  - 只想看云端信息: 本命令的 SaaS / DNS 部分仍然可用"
+    )
+
 def parse_ingress_hostnames(text: str) -> List[Tuple[str, str]]:
     """返回 [(hostname, service), ...]，不含 catch-all。"""
     lines = text.splitlines()
@@ -1434,7 +1453,12 @@ def _ensure_fallback_ingress(lines: List[str]) -> bool:
 def upsert_tunnel_hostname(hostname: str, service_url: str) -> bool:
     """新增/更新 ingress；返回是否真的修改了配置。"""
     if not CONFIG_PATH.exists():
-        raise CFError(f"找不到隧道配置: {CONFIG_PATH}")
+        raise CFError(
+            f"找不到隧道配置: {CONFIG_PATH}\n"
+            "  本机可能还没建隧道。处理方式:\n"
+            "  1) 已有隧道: ./install.sh --service  （自动生成配置和 systemd 服务）\n"
+            "  2) 路径不同: 用 CF_TUNNEL_ACCEL_CONFIG=/实际/路径.yml 指定",
+        )
 
     text = CONFIG_PATH.read_text(encoding="utf-8")
     if "ingress:" not in text:
@@ -2213,6 +2237,10 @@ def add_accelerated_service(
         zone_name, zone_id = zone
         cprint(f"所属 zone: {zone_name}", "cyan")
 
+    # 0) 先确认本机有隧道配置，避免改完云端 DNS 才发现路由写不进去
+    if not CONFIG_PATH.exists():
+        raise CFError(config_missing_hint())
+
     # 0) 本地后端探活，避免“隧道配置成功但访问 502”
     check_local_backend(service_url, host_header=hostname)
 
@@ -2223,11 +2251,11 @@ def add_accelerated_service(
     current_cdn = get_current_preferred_target(strict=True)
 
     # 2) tunnel：配置变更才重启；校验/重启失败自动恢复调用前版本。
-    config_before = CONFIG_PATH.read_text(encoding="utf-8")
+    config_before = read_config_text()
     try:
         config_changed = upsert_tunnel_hostname(hostname, service_url)
         # 确保 origin 在 ingress 中，而不是只在注释或其它字段中出现。
-        cfg_lines = CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+        cfg_lines = read_config_text().splitlines()
         if not _has_ingress_hostname(cfg_lines, FALLBACK_ORIGIN):
             config_changed = (
                 upsert_tunnel_hostname(FALLBACK_ORIGIN, "http://127.0.0.1:8317")
@@ -2244,7 +2272,7 @@ def add_accelerated_service(
     except Exception:
         # 若配置阶段在校验前就中断，也不要留下半套 ingress。
         try:
-            if CONFIG_PATH.read_text(encoding="utf-8") != config_before:
+            if config_before and read_config_text() != config_before:
                 atomic_write_text(CONFIG_PATH, config_before)
         except Exception:
             pass
@@ -2379,8 +2407,13 @@ def remove_service(hostname: str) -> None:
 
 def list_all() -> None:
     cprint("\n====== 隧道主机名 ======", "bold")
-    text = CONFIG_PATH.read_text(encoding="utf-8")
-    for host, service in parse_ingress_hostnames(text):
+    text = read_config_text()
+    routes = parse_ingress_hostnames(text) if text else []
+    if not routes:
+        cprint("  （本机没有可读的隧道配置）", "yellow")
+        for line in config_missing_hint().splitlines():
+            cprint(f"  {line}", "yellow")
+    for host, service in routes:
         mark = " [系统回退源]" if host == FALLBACK_ORIGIN else ""
         cprint(f"  {host:30s} -> {service}{mark}")
 
@@ -2445,7 +2478,8 @@ def show_status() -> None:
             "green" if check.returncode == 0 else "red",
         )
     else:
-        cprint(f"Tunnel config: 不存在 {CONFIG_PATH}", "red")
+        for line in config_missing_hint().splitlines():
+            cprint(line, "red")
 
     try:
         current = get_current_preferred_target(strict=True)
@@ -2553,6 +2587,8 @@ def health_check(hostname: Optional[str] = None, include_https: bool = False) ->
     failures = 0
     if not CONFIG_PATH.exists():
         cprint(f"FAIL config 不存在: {CONFIG_PATH}", "red")
+        for line in config_missing_hint().splitlines()[1:]:
+            cprint(f"  {line}", "yellow")
         return False
 
     text = CONFIG_PATH.read_text(encoding="utf-8")
@@ -2876,6 +2912,11 @@ def menu() -> None:
 """,
         "bold",
     )
+    if not CONFIG_PATH.exists():
+        for line in config_missing_hint().splitlines():
+            cprint(line, "yellow")
+        cprint("提示: 1/3/4/5 需要本机隧道配置；2/6/7 的云端部分仍可用。", "yellow")
+        print()
     while True:
         current_cdn = get_current_preferred_target(strict=True)
         cprint(f"当前优选 CDN: {PREFERRED_ENTRY} -> {current_cdn}", "cyan")
