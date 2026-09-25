@@ -34,14 +34,50 @@ Cloudflare Tunnel + **双域名（辅助域 SaaS）优选加速**一键脚本。
 - `curl`、`dig`（验收与测速）
 - `systemd`（隧道服务与定时优选）
 
-## 安装
+## 安装（交互式，缺什么装什么）
 
 ```bash
-git clone https://github.com/<you>/cf-tunnel-accel.git
+git clone https://github.com/zzhjj/cf-tunnel-accel.git
 cd cf-tunnel-accel
-./install.sh                  # 安装到 /root/bin + 软链到 /usr/local/bin
-./install.sh <CF_API_TOKEN>   # 顺带写入 Token（权限 600）
+./install.sh                       # 交互式：每步都有默认值，回车即可
+./install.sh -y                    # 无人值守，全用默认值
+./install.sh -y --token <TOKEN>    # 顺带写入 API Token
+./install.sh -y --service          # 顺带创建/修复 systemd 隧道服务
+./install.sh --dry-run             # 只看会做什么，不落盘
 ```
+
+install.sh 会依次做六步，**缺依赖自动装**（apt/dnf/yum/apk/pacman 都认）：
+
+| 步骤 | 内容 |
+|---|---|
+| 1 | 安装脚本本体到 `/root/bin`，软链到 `/usr/local/bin`，旧版自动备份 |
+| 2 | 检查并安装 `python3` / `curl` / `dig` / `systemctl` / **cloudflared** |
+| 3 | 配置 Cloudflare API Token（权限 600，可交互粘贴或 `--token`） |
+| 4 | 可选：生成 `~/.config/cf-tunnel-accel/env` 覆盖模板（多机部署用） |
+| 5 | 可选：写 systemd 隧道服务并 `enable --now`，随后校验 ingress |
+| 6 | 自检：脚本可用性 + `cf-tunnel-accel env` + 读取域名清单 |
+
+cloudflared 安装方式（`CFA_CFD_METHOD=auto|repo|binary`）：
+
+- `repo`：官方源（Debian/Ubuntu 走 `pkg.cloudflare.com` apt 源，RHEL 系走 yum repo）——国内网络友好
+- `binary`：GitHub Releases 单文件二进制；下载慢时可加镜像前缀，例如
+  `CFA_GH_MIRROR=https://ghproxy.net/ ./install.sh -y`
+
+默认值会**自动对齐本机现状**：已存在的 `config-*.yml`、`cloudflared-*.service`、隧道凭据会被识别，通常一路回车即可。
+需要另一套隧道时用 `--tunnel-name home2`（配置/服务名会跟着变），或 `--config/--hostname/--backend` 显式指定。
+
+### install.sh 常用参数
+
+| 参数 | 说明 |
+|---|---|
+| `-y, --yes` | 不询问，全用默认值（非交互终端自动如此） |
+| `--token <TOKEN>` | 写入 API Token |
+| `--no-deps` | 不自动安装依赖 |
+| `--service` / `--no-service` | 强制 / 禁止创建 systemd 服务 |
+| `--tunnel-name <n>` | 隧道名，默认 `home` |
+| `--config <path>` | 隧道配置路径 |
+| `--hostname <域名>` / `--backend <ip:port>` | 生成配置时写入的 hostname / 本地服务 |
+| `--dry-run` | 只打印动作 |
 
 ## 首次配置
 
@@ -61,7 +97,9 @@ cd cf-tunnel-accel
    cloudflared tunnel create home            # 生成 <TUNNEL_ID>.json 凭据
    cloudflared tunnel route dns home origin.<辅助域>
    ```
-   把隧道写入 `/root/.cloudflared/config-home.yml`（`tunnel:`、`credentials-file:`、`ingress:`），并创建 systemd 服务（默认名 `cloudflared-home.service`）。
+   上面两步（`login` / `create`）需要浏览器，必须在交互式终端里做。完成后再跑一次
+   `./install.sh --service`，install.sh 会自动识别凭据、生成 `config-home.yml` 和 systemd 服务，
+   并校验 ingress；也可以自己写配置，install.sh 只负责建/修复服务。
 3. **核对配置**：`cf-tunnel-accel env`，再 `cf-tunnel-accel domains` 确认能读到域名清单。
 4. 试试加速一个服务：`cf-tunnel-accel add` → 从列表里挑域名 → 填 `127.0.0.1:8080` → 自动验收。
 
