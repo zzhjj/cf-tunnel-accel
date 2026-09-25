@@ -58,7 +58,8 @@ if [ ! -f "$ENV_FILE" ]; then
 # CF_TUNNEL_ACCEL_PREFERRED_TARGET=cf.090227.xyz
 # CF_TUNNEL_ACCEL_TOKEN_FILE=/root/.config/cf-tunnel-accel/token
 EOF
-  echo "==> 已生成配置模板: $ENV_FILE.example"
+  chmod 600 "$ENV_FILE.example"
+  echo "==> 已生成配置模板: $ENV_FILE.example（600）"
 fi
 
 echo "==> 依赖检查"

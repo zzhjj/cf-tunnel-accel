@@ -99,6 +99,22 @@ cd cf-tunnel-accel
   注意：**同一台服务器上不同隧道的 ingress hostname 不要重复**，同一个 hostname 只能指向一个后端。
 - **只在新服务器上跑优选调度**：装好脚本 + Token，`cf-tunnel-accel cdn best` 或 `schedule install 6`。此时不需要隧道，`add/health` 会因缺少本地服务报错，属预期。
 
+**在新服务器上取代码**（仓库是私有的，需要先有凭据，三选一）
+
+```bash
+# 1) 装了 gh 并登录（最省事）
+gh auth login && gh repo clone zzhjj/cf-tunnel-accel
+
+# 2) 用 PAT（只勾 repo 权限）
+git clone https://<user>:<PAT>@github.com/zzhjj/cf-tunnel-accel.git
+
+# 3) 该机器有 ssh key 时用部署密钥（repo → Settings → Deploy keys，只读即可）
+git clone git@github.com:zzhjj/cf-tunnel-accel.git
+
+# 国内机器需要代理时
+git config --global http.proxy http://127.0.0.1:7890
+```
+
 ## 目录与文件
 
 | 路径 | 说明 |
