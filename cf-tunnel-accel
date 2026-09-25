@@ -1,0 +1,3188 @@
+#!/usr/bin/env -S python3 -u
+# -*- coding: utf-8 -*-
+"""
+交互式 Cloudflare Tunnel + 双域名优选加速脚本
+
+功能：
+1) 新增域名并自动加速（Tunnel + SaaS + DNS + 优选 CNAME）
+2) 列出当前隧道主机名 / SaaS 自定义主机名 / DNS
+3) 仅刷新/切换某域名到优选入口
+4) 删除业务域名（隧道 + SaaS + DNS）
+5) HTTPS 实测并一键切换公共优选 CDN（防抖）
+6) 全链路健康诊断（Tunnel / 后端 / SaaS / DNS / 可选 HTTPS）
+7) 可选 systemd 定时自动优选
+0) 自动识别账号里有哪些域名可用（cf-tunnel-accel domains）：
+   zone 状态/接入方式、已加速主机名、SaaS 配额、额外辅助域、以及
+   只给某个 zone 时能从已有主机名里挑子域名（不用记域名）
+   domains 命令与新增向导共用本机清单缓存 zones.json（离线也能看）
+
+默认架构：
+  业务域名 --(关黄云 CNAME)--> cdn.v50kkp.eu.org
+           --(关黄云 CNAME)--> 公共优选 CDN
+           --> 辅助域 SaaS 识别 Host
+           --> origin.v50kkp.eu.org (开黄云, 回退源)
+           --> home tunnel --> 本地 ip:port
+"""
+
+from __future__ import annotations
+
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import statistics
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# 服务器级配置：KEY=VALUE 文件（多机部署时不用改脚本本体）
+# 已存在的环境变量优先，文件只做兜底。
+ENV_FILE = Path(
+    os.environ.get("CF_TUNNEL_ACCEL_ENV_FILE", "/root/.config/cf-tunnel-accel/env")
+)
+
+
+def load_env_file(path: Optional[Path] = None) -> None:
+    """把 KEY=VALUE 配置读进环境变量（不覆盖已设置的值）。"""
+    target = ENV_FILE if path is None else path
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file()
+# =========================
+# 可改配置
+# =========================
+SCRIPT_VERSION = "1.3.0"
+
+# Token 优先级：环境变量 > root-only token 文件。将 Token 留在文件中可避免
+# 脚本同步/备份时泄露。可用 CF_TUNNEL_ACCEL_TOKEN_FILE 覆盖默认位置。
+TOKEN_FILE = Path(
+    os.environ.get("CF_TUNNEL_ACCEL_TOKEN_FILE", "/root/.config/cf-tunnel-accel/token")
+)
+LOCK_PATH = Path("/run/cf-tunnel-accel.lock")
+
+
+def read_api_token() -> str:
+    for name in ("CF_TUNNEL_ACCEL_API_TOKEN", "CF_API_TOKEN"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    try:
+        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_str(name: str, default: str) -> str:
+    """基础设施常量也支持环境变量覆盖，方便同一份脚本部署到多台服务器。"""
+    value = os.environ.get(name, "").strip()
+    return value or default
+
+
+CF_API_TOKEN = read_api_token()
+ACCOUNT_ID = env_str(
+    "CF_TUNNEL_ACCEL_ACCOUNT_ID", "4bbdc61b5e6d14d283e4d0358ea4e5b0"
+)
+TUNNEL_ID = env_str(
+    "CF_TUNNEL_ACCEL_TUNNEL_ID", "626b1159-f63d-4d85-94d9-208813edbfcd"
+)
+TUNNEL_NAME = env_str("CF_TUNNEL_ACCEL_TUNNEL_NAME", "home")
+
+AUX_ZONE_NAME = env_str("CF_TUNNEL_ACCEL_AUX_ZONE", "v50kkp.eu.org")
+AUX_ZONE_ID = env_str(
+    "CF_TUNNEL_ACCEL_AUX_ZONE_ID", "beaf16d441346d4b739cdb0a6b03ca9c"
+)
+FALLBACK_ORIGIN = env_str(
+    "CF_TUNNEL_ACCEL_FALLBACK_ORIGIN", f"origin.{AUX_ZONE_NAME}"
+)
+PREFERRED_ENTRY = env_str(
+    "CF_TUNNEL_ACCEL_PREFERRED_ENTRY", f"cdn.{AUX_ZONE_NAME}"
+)
+# 当前默认优选目标（可被菜单/命令动态切换）
+PREFERRED_TARGET = env_str("CF_TUNNEL_ACCEL_PREFERRED_TARGET", "cf.090227.xyz")
+# 内置公共优选 CDN 候选，可自行增删（逗号分隔即可覆盖）
+CDN_CANDIDATES = [
+    item.strip()
+    for item in env_str(
+        "CF_TUNNEL_ACCEL_CDN_CANDIDATES",
+        "cf.090227.xyz,singgcdn.singgnetworkcdn.com,cloudflare.182682.xyz",
+    ).split(",")
+    if item.strip()
+]
+
+CONFIG_PATH = Path(
+    env_str("CF_TUNNEL_ACCEL_CONFIG", "/root/.cloudflared/config-home.yml")
+)
+SERVICE_NAME = env_str(
+    "CF_TUNNEL_ACCEL_SERVICE", "cloudflared-home.service"
+)
+CLOUDFLARED_BIN = env_str(
+    "CF_TUNNEL_ACCEL_CLOUDFLARED", "/usr/local/bin/cloudflared"
+)
+API_BASE = env_str(
+    "CF_TUNNEL_ACCEL_API_BASE", "https://api.cloudflare.com/client/v4"
+)
+AUTO_CDN_SERVICE_UNIT = Path(
+    env_str(
+        "CF_TUNNEL_ACCEL_CDN_SERVICE_UNIT",
+        "/etc/systemd/system/cf-tunnel-accel-cdn.service",
+    )
+)
+AUTO_CDN_TIMER_UNIT = Path(
+    env_str(
+        "CF_TUNNEL_ACCEL_CDN_TIMER_UNIT",
+        "/etc/systemd/system/cf-tunnel-accel-cdn.timer",
+    )
+)
+API_RETRY_ATTEMPTS = env_int("CF_TUNNEL_ACCEL_API_RETRIES", 3, minimum=1)
+API_RETRY_MAX_WAIT = env_float("CF_TUNNEL_ACCEL_API_RETRY_MAX_WAIT", 8.0, minimum=1.0)
+CDN_SWITCH_MIN_IMPROVEMENT_PERCENT = env_float(
+    "CF_TUNNEL_ACCEL_CDN_MIN_IMPROVEMENT", 15.0, minimum=0.0
+)
+
+def env_known_zones(default: Dict[str, str]) -> Dict[str, str]:
+    """CF_TUNNEL_ACCEL_KNOWN_ZONES="a.com:<zone_id>,b.com:<zone_id>" 可追加/覆盖离线表。"""
+    result = dict(default)
+    for item in env_str("CF_TUNNEL_ACCEL_KNOWN_ZONES", "").split(","):
+        name, sep, zid = item.partition(":")
+        if sep and name.strip() and zid.strip():
+            result[name.strip().lower()] = zid.strip()
+    return result
+
+
+# 已知 zone 缓存（可自动补充）
+KNOWN_ZONES = env_known_zones(
+    {
+        "zzhnb.cf": "cf1bb8d457217936bcca41555c08144d",
+        "261119.xyz": "16afabbf2ed8e22e6ba6ea30517fd126",
+        "v50kkp.eu.org": "beaf16d441346d4b739cdb0a6b03ca9c",
+    }
+)
+
+# 账号 zone 清单缓存：清单一变，所有“有哪些域名可用”的判断都基于它。
+# 只存 zone 名称/ID/状态等非敏感信息，Token 不落盘。
+ZONE_CACHE_PATH = Path(
+    os.environ.get(
+        "CF_TUNNEL_ACCEL_ZONE_CACHE",
+        "/root/.config/cf-tunnel-accel/zones.json",
+    )
+)
+# 清单多久后视为过期（秒，默认 6 小时；0 表示每次都刷新）
+ZONE_CACHE_TTL = env_int("CF_TUNNEL_ACCEL_ZONE_CACHE_TTL", 21600, minimum=0)
+
+HOST_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
+)
+SERVICE_RE = re.compile(
+    r"^(?P<scheme>https?://)?"
+    r"(?P<host>(?:\d{1,3}\.){3}\d{1,3}|localhost|[A-Za-z0-9.-]+)"
+    r":(?P<port>\d{1,5})$"
+)
+
+
+class CFError(RuntimeError):
+    pass
+
+
+def cprint(msg: str = "", color: Optional[str] = None) -> None:
+    colors = {
+        "red": "\033[31m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "cyan": "\033[36m",
+        "bold": "\033[1m",
+        "reset": "\033[0m",
+    }
+    if color and sys.stdout.isatty():
+        print(f"{colors.get(color, '')}{msg}{colors['reset']}", flush=True)
+    else:
+        print(msg, flush=True)
+
+
+def prompt(text: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        val = input(f"{text}{suffix}: ").strip()
+        if not val and default is not None:
+            return default
+        if val:
+            return val
+        cprint("不能为空，请重新输入。", "yellow")
+
+
+def prompt_yes_no(text: str, default: bool = True) -> bool:
+    tip = "Y/n" if default else "y/N"
+    while True:
+        val = input(f"{text} [{tip}]: ").strip().lower()
+        if not val:
+            return default
+        if val in ("y", "yes", "是"):
+            return True
+        if val in ("n", "no", "否"):
+            return False
+        cprint("请输入 y 或 n。", "yellow")
+
+
+def read_line(text: str) -> Optional[str]:
+    """读一行输入；stdin 结束时按“取消”处理，而不是抛 EOF 栈。"""
+    try:
+        return input(text)
+    except EOFError:
+        print()
+        return None
+
+def _retry_delay(attempt: int, retry_after: Optional[str] = None) -> float:
+    try:
+        if retry_after is not None:
+            return min(API_RETRY_MAX_WAIT, max(0.1, float(retry_after)))
+    except ValueError:
+        pass
+    return min(API_RETRY_MAX_WAIT, float(2 ** (attempt - 1)))
+
+
+def _can_retry_api(method: str, status: Optional[int] = None) -> bool:
+    """仅重试幂等请求，避免 POST 超时后意外创建重复资源。"""
+    if method.upper() not in {"GET", "PUT", "DELETE"}:
+        return False
+    return status is None or status == 429 or 500 <= status <= 599
+
+
+def api(method: str, path: str, body: Optional[dict] = None, timeout: int = 45) -> dict:
+    if not CF_API_TOKEN:
+        return {
+            "success": False,
+            "errors": [{
+                "code": "token_missing",
+                "message": (
+                    "未找到 API Token；请设置 CF_TUNNEL_ACCEL_API_TOKEN / CF_API_TOKEN，"
+                    f"或写入 {TOKEN_FILE}"
+                ),
+            }],
+        }
+    url = path if path.startswith("http") else f"{API_BASE}{path}"
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {CF_API_TOKEN}",
+                "Content-Type": "application/json",
+                "User-Agent": f"cf-tunnel-accel/{SCRIPT_VERSION}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {"success": False, "errors": [{"message": raw}], "status": e.code}
+            if attempt < API_RETRY_ATTEMPTS and _can_retry_api(method, e.code):
+                delay = _retry_delay(attempt, e.headers.get("Retry-After") if e.headers else None)
+                cprint(
+                    f"Cloudflare API HTTP {e.code}，{delay:.1f}s 后重试 "
+                    f"({attempt}/{API_RETRY_ATTEMPTS - 1})...",
+                    "yellow",
+                )
+                time.sleep(delay)
+                continue
+            return payload
+        except Exception as e:
+            if attempt < API_RETRY_ATTEMPTS and _can_retry_api(method):
+                delay = _retry_delay(attempt)
+                cprint(
+                    f"Cloudflare API 网络错误: {e}；{delay:.1f}s 后重试 "
+                    f"({attempt}/{API_RETRY_ATTEMPTS - 1})...",
+                    "yellow",
+                )
+                time.sleep(delay)
+                continue
+            return {"success": False, "errors": [{"message": str(e)}]}
+    return {"success": False, "errors": [{"message": "API 重试耗尽"}]}
+
+
+def api_ok(resp: dict, action: str = "API") -> dict:
+    if resp.get("success"):
+        return resp
+    errs = resp.get("errors") or [{"message": "unknown error"}]
+    msg = "; ".join(
+        f"[{e.get('code','?')}] {e.get('message', e)}" if isinstance(e, dict) else str(e)
+        for e in errs
+    )
+    raise CFError(f"{action} 失败: {msg}")
+
+
+def run(
+    cmd: List[str], check: bool = True, timeout: Optional[float] = 60
+) -> subprocess.CompletedProcess:
+    try:
+        p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        raise CFError(f"未找到命令: {cmd[0]}") from None
+    except subprocess.TimeoutExpired:
+        raise CFError(f"命令超时（{timeout}s）: {' '.join(cmd)}") from None
+    if check and p.returncode != 0:
+        raise CFError(
+            f"命令失败: {' '.join(cmd)}\nstdout: {p.stdout}\nstderr: {p.stderr}"
+        )
+    return p
+
+
+@contextmanager
+def exclusive_lock() -> Any:
+    """阻止多个脚本实例同时修改 DNS、SaaS 或 Tunnel 配置。"""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.seek(0)
+            holder = lock_file.read().strip() or "未知进程"
+            raise CFError(f"已有 cf-tunnel-accel 实例正在运行（{holder}）") from None
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid={os.getpid()} started={datetime.now().isoformat(timespec='seconds')}\n")
+        lock_file.flush()
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.flush()
+            os.fsync(lock_file.fileno())
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+# =========================
+# Zone / DNS helpers
+# =========================
+_zone_cache: Dict[str, str] = dict(KNOWN_ZONES)
+# 账号内 zone 的元数据：name -> {id,status,type,plan,paused,account,cached}
+_zone_info: Dict[str, dict] = {}
+_zone_cache_updated_at: float = 0.0
+_zone_cache_from_disk: set = set()
+_ZONE_CACHE_FILE_VERSION = 1
+# 新增向导里提示可用的子域前缀（仅示例，不强制）
+HOSTNAME_HINTS = ["app", "web", "www", "api", "test", "dev", "new", "tool", "box", "go"]
+
+
+def list_zones() -> List[dict]:
+    items: List[dict] = []
+    page = 1
+    while True:
+        resp = api_ok(api("GET", f"/zones?per_page=50&page={page}"), "列出 zones")
+        batch = resp.get("result") or []
+        items.extend(batch)
+        info = resp.get("result_info") or {}
+        total_pages = int(info.get("total_pages") or 1)
+        if page >= total_pages or not batch:
+            break
+        page += 1
+    return items
+
+
+def load_zone_cache_file() -> None:
+    """读取本机 zone 清单（不联网）：Token 失效或离线时也能看到账号里有哪些域名。"""
+    global _zone_cache_updated_at
+    try:
+        data = json.loads(ZONE_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    zones = data.get("zones") or []
+    if isinstance(zones, dict):  # 兼容 {name: id} 形态
+        zones = [{"name": k, "id": v} for k, v in zones.items()]
+    for item in zones:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip().lower()
+        zid = str(item.get("id") or "").strip()
+        if not name or not zid:
+            continue
+        _zone_cache[name] = zid
+        meta = {k: v for k, v in item.items() if k != "name"}
+        meta["name"] = name
+        meta["cached"] = True
+        _zone_info[name] = meta
+        _zone_cache_from_disk.add(name)
+    try:
+        _zone_cache_updated_at = float(data.get("updated_at") or 0.0)
+    except (TypeError, ValueError):
+        _zone_cache_updated_at = 0.0
+
+
+def save_zone_cache_file() -> None:
+    if not _zone_info:
+        return
+    payload = {
+        "version": _ZONE_CACHE_FILE_VERSION,
+        "updated_at": _zone_cache_updated_at or time.time(),
+        "aux_zone": AUX_ZONE_NAME,
+        "zones": [
+            {k: v for k, v in sorted(meta.items()) if k != "cached"}
+            for _, meta in sorted(_zone_info.items())
+        ],
+    }
+    try:
+        atomic_write_text(
+            ZONE_CACHE_PATH, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        )
+        os.chmod(ZONE_CACHE_PATH, 0o600)
+    except Exception as exc:  # 缓存写失败不能影响主流程
+        cprint(f"警告: zone 清单缓存写入失败: {exc}", "yellow")
+
+
+def zone_cache_age() -> Optional[float]:
+    if not _zone_cache_updated_at:
+        return None
+    return max(0.0, time.time() - _zone_cache_updated_at)
+
+
+def zone_cache_age_text() -> str:
+    age = zone_cache_age()
+    if age is None:
+        return "未知"
+    if age < 90:
+        return f"{age:.0f} 秒前"
+    if age < 5400:
+        return f"{age / 60:.0f} 分钟前"
+    return f"{age / 3600:.1f} 小时前"
+
+
+def refresh_zone_cache() -> None:
+    """从 API 重建账号 zone 清单，并写入本机缓存。"""
+    global _zone_cache_updated_at
+    live: set = set()
+    for z in list_zones():
+        name = str(z.get("name") or "").strip().lower()
+        zid = str(z.get("id") or "").strip()
+        if not name or not zid:
+            continue
+        live.add(name)
+        _zone_cache[name] = zid
+        plan = z.get("plan") or {}
+        _zone_info[name] = {
+            "name": name,
+            "id": zid,
+            "status": z.get("status") or "unknown",
+            "type": z.get("type") or "unknown",
+            "paused": bool(z.get("paused")),
+            "plan": plan.get("name") or plan.get("legacy_id") or "unknown",
+            "account": (z.get("account") or {}).get("name") or "",
+            "cached": False,
+        }
+    # 账号里已经删掉的域名别留在缓存里误导选择
+    for stale in sorted(_zone_cache_from_disk - live):
+        _zone_cache.pop(stale, None)
+        _zone_info.pop(stale, None)
+    _zone_cache_from_disk.clear()
+    _zone_cache_updated_at = time.time()
+    save_zone_cache_file()
+
+
+def ensure_zone_cache(max_age: Optional[int] = None) -> None:
+    """清单过期就刷新一次；刷新失败时继续用本机缓存。"""
+    limit = ZONE_CACHE_TTL if max_age is None else max_age
+    age = zone_cache_age()
+    if age is not None and limit >= 0 and age <= limit:
+        return
+    try:
+        refresh_zone_cache()
+    except Exception as exc:
+        if not _zone_cache:
+            raise
+        cprint(f"警告: zone 清单刷新失败，改用本机缓存（{exc}）", "yellow")
+
+
+def zone_of_host(hostname: str) -> Optional[str]:
+    """纯本地判断 hostname 属于哪个已缓存 zone（不发请求）。"""
+    labels = str(hostname).lower().strip(".").split(".")
+    for i in range(len(labels) - 1):
+        candidate = ".".join(labels[i:])
+        if candidate in _zone_cache:
+            return candidate
+    return None
+
+
+def resolve_zone(hostname: str) -> Optional[Tuple[str, str]]:
+    """返回 hostname 所属 zone（找不到返回 None，不抛异常）。"""
+    host = str(hostname).lower().strip(".")
+    hit = zone_of_host(host)
+    if hit:
+        return hit, _zone_cache[hit]
+    try:
+        refresh_zone_cache()
+    except Exception:
+        return None
+    hit = zone_of_host(host)
+    if hit:
+        return hit, _zone_cache[hit]
+    # 逐级查询，覆盖刚添加、清单还没刷到的情况
+    labels = host.split(".")
+    for i in range(len(labels) - 1):
+        candidate = ".".join(labels[i:])
+        resp = api("GET", f"/zones?name={urllib.parse.quote(candidate)}")
+        if resp.get("success") and resp.get("result"):
+            z = resp["result"][0]
+            name = str(z.get("name") or candidate).strip().lower()
+            _zone_cache[name] = z["id"]
+            plan = z.get("plan") or {}
+            _zone_info[name] = {
+                "name": name,
+                "id": z["id"],
+                "status": z.get("status") or "unknown",
+                "type": z.get("type") or "unknown",
+                "paused": bool(z.get("paused")),
+                "plan": plan.get("name") or plan.get("legacy_id") or "unknown",
+                "account": "",
+                "cached": False,
+            }
+            return name, z["id"]
+    return None
+
+
+def parent_zone_for_host(hostname: str) -> Tuple[str, str]:
+    found = resolve_zone(hostname)
+    if found is None:
+        raise CFError(f"找不到域名 {hostname} 所属 Cloudflare zone，请确认已接入本账号。")
+    return found
+
+
+# =========================
+# 域名可用性自检（domains 命令 / 新增向导共用）
+# =========================
+
+
+def tunnel_routes() -> List[Tuple[str, str]]:
+    """当前隧道 ingress 里的 hostname -> service。"""
+    try:
+        if CONFIG_PATH.exists():
+            return parse_ingress_hostnames(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return []
+
+
+def saas_fallback_map() -> Dict[str, str]:
+    """哪些 zone 配了 SaaS fallback origin（正常只有辅助域一个）。"""
+    found: Dict[str, str] = {}
+    for name, meta in sorted(_zone_info.items()):
+        zid = str(meta.get("id") or "")
+        if not zid:
+            continue
+        resp = api("GET", f"/zones/{zid}/custom_hostnames/fallback_origin")
+        result = resp.get("result") or {}
+        if resp.get("success") and result.get("origin"):
+            found[name] = str(result["origin"])
+    return found
+
+
+def saas_quota() -> Optional[dict]:
+    resp = api("GET", f"/zones/{AUX_ZONE_ID}/custom_hostnames/quota")
+    return resp.get("result") if resp.get("success") else None
+
+
+def zone_dns_summary(zone_id: str) -> Dict[str, List[str]]:
+    """轻量扫描 zone：哪些 CNAME 指向优选/回退源，哪些名字上已有 A/AAAA。"""
+    summary: Dict[str, List[str]] = {"entry_cnames": [], "addressed": []}
+    for r in list_dns(zone_id):
+        rtype = str(r.get("type") or "")
+        name = str(r.get("name") or "").lower()
+        content = str(r.get("content") or "").rstrip(".")
+        if rtype == "CNAME" and content in (PREFERRED_ENTRY, FALLBACK_ORIGIN):
+            summary["entry_cnames"].append(name)
+        elif rtype in ("A", "AAAA"):
+            summary["addressed"].append(f"{rtype} {name}")
+    return summary
+
+
+def build_zone_inventory(
+    refresh: bool = True, with_dns: bool = True, offline: bool = False
+) -> List[dict]:
+    """汇总账号内每个 zone 的可用性，供 domains 命令与新增向导共用。
+
+    offline=True 时完全不发请求，只用本机缓存清单。
+    """
+    if offline:
+        refresh, with_dns = False, False
+    if refresh:
+        ensure_zone_cache()
+    routes = tunnel_routes()
+    tunnel_hosts = {host for host, _ in routes}
+    ch_by_host: Dict[str, dict] = {}
+    quota: Optional[dict] = None
+    fallbacks: Dict[str, str] = {}
+    if not offline:
+        try:
+            ch_by_host = {
+                str(item.get("hostname") or "").lower(): item
+                for item in list_custom_hostnames()
+            }
+        except Exception as exc:
+            cprint(f"警告: 读取 SaaS 自定义主机名失败: {exc}", "yellow")
+        try:
+            quota = saas_quota()
+        except Exception:
+            quota = None
+        try:
+            fallbacks = saas_fallback_map()
+        except Exception:
+            fallbacks = {}
+    quota_exceeded = bool((quota or {}).get("exceeded"))
+
+    rows: List[dict] = []
+    for name, meta in sorted(_zone_info.items()):
+        zid = str(meta.get("id") or "")
+        status = str(meta.get("status") or "unknown")
+        ztype = str(meta.get("type") or "unknown")
+        reasons: List[str] = []
+        usable = True
+        if status != "active":
+            usable = False
+            reasons.append(f"status={status}，域名还没在 Cloudflare 激活")
+        if meta.get("paused"):
+            usable = False
+            reasons.append("zone 已暂停 paused")
+        if ztype not in ("full", "unknown"):
+            reasons.append(f"type={ztype}（CNAME 接入），部分记录不受本账号控制")
+        if quota_exceeded:
+            usable = False
+            reasons.append("SaaS 自定义主机名配额已用尽")
+        in_zone = sorted(
+            host
+            for host in set(ch_by_host) | tunnel_hosts
+            if zone_of_host(host) == name
+        )
+        entry_cnames = in_zone
+        addressed: List[str] = []
+        if with_dns and zid:
+            try:
+                summary = zone_dns_summary(zid)
+            except Exception as exc:
+                cprint(f"警告: 读取 {name} 的 DNS 失败: {exc}", "yellow")
+                summary = {"entry_cnames": [], "addressed": []}
+            entry_cnames = sorted(set(summary["entry_cnames"]) | set(in_zone))
+            addressed = summary["addressed"]
+        rows.append(
+            {
+                "name": name,
+                "id": zid,
+                "status": status,
+                "type": ztype,
+                "plan": str(meta.get("plan") or "unknown"),
+                "usable": usable,
+                "reasons": reasons,
+                "is_aux": name in fallbacks or zid == AUX_ZONE_ID,
+                "fallback_origin": fallbacks.get(name)
+                or (FALLBACK_ORIGIN if zid == AUX_ZONE_ID else None),
+                "hostnames": entry_cnames,
+                "saas": sorted(h for h in in_zone if h in ch_by_host),
+                "tunnel": sorted(h for h in in_zone if h in tunnel_hosts),
+                "addressed": addressed,
+                "cached": bool(meta.get("cached")),
+            }
+        )
+    return rows
+
+
+def _shorten(names: List[str], limit: int = 8) -> str:
+    if not names:
+        return "-"
+    head = ", ".join(names[:limit])
+    return f"{head} 等 {len(names)} 个" if len(names) > limit else head
+
+
+def print_domains(show_dns: bool = True, offline: bool = False) -> int:
+    """回答“我到底有哪些域名可以用”。"""
+    if offline:
+        load_zone_cache_file()
+    rows = build_zone_inventory(
+        refresh=not offline,
+        with_dns=show_dns and not offline,
+        offline=offline,
+    )
+    if not rows:
+        cprint("没有读到任何 zone；请确认 Token 有效（权限需要 Zone:Read）。", "red")
+        return 1
+    width = max(len(r["name"]) for r in rows)
+    tail = "（离线，仅本机缓存）" if offline else f"（清单更新于 {zone_cache_age_text()}）"
+    cprint(f"\n====== 账号可用域名：{len(rows)} 个 zone {tail} ======", "bold")
+    cprint(f"  #   {'域名'.ljust(width)}  状态    接入  已加速  判定")
+    for idx, r in enumerate(rows, start=1):
+        if r["is_aux"]:
+            tag = "辅助域" if r["name"] == AUX_ZONE_NAME else "额外辅助域"
+        else:
+            tag = "业务域"
+        used = f"{len(r['hostnames']):>3}"
+        if r["usable"]:
+            cprint(
+                f"  {idx:<3} {r['name'].ljust(width)}  {r['status']:<7} {r['type']:<5} {used}  "
+                f" ✓ 可用（{tag}）",
+                "green",
+            )
+            for warn in r["reasons"]:
+                cprint(f"        - 注意: {warn}", "yellow")
+        else:
+            cprint(
+                f"  {idx:<3} {r['name'].ljust(width)}  {r['status']:<7} {r['type']:<5} {used}  "
+                f" ✗ 不可用（{tag}）：" + "；".join(r["reasons"]),
+                "red",
+            )
+        if r["addressed"]:
+            cprint(f"        已有 A/AAAA（新增同名子域时会冲突）: {_shorten(r['addressed'], 3)}", "cyan")
+
+    cprint("\n====== 已加速主机名（按 zone 归类）======", "bold")
+    unused_rows: List[dict] = []
+    for r in rows:
+        if not r["hostnames"]:
+            unused_rows.append(r)
+            continue
+        cprint(
+            f"  [{r['name']}] {len(r['hostnames'])} 个:"
+            f" {_shorten(r['hostnames'])}"
+        )
+    if unused_rows:
+        detail = [
+            r["name"]
+            + (f"（已有 {len(r['addressed'])} 条 A/AAAA）" if r["addressed"] else "")
+            for r in unused_rows
+        ]
+        cprint(f"  尚未加速（可直接拿来新增）: {', '.join(detail)}", "cyan")
+
+    if not offline:
+        try:
+            quota = saas_quota()
+        except Exception:
+            quota = None
+        if quota:
+            flag = "，已超额" if quota.get("exceeded") else ""
+            cprint(
+                f"\nSaaS 自定义主机名配额: {quota.get('used')} / {quota.get('allocated')}"
+                f"（hard cap {quota.get('hard_cap')}{flag}）",
+                "yellow" if quota.get("exceeded") else "cyan",
+            )
+        for r in rows:
+            if r["id"] == AUX_ZONE_ID or not r["fallback_origin"]:
+                continue
+            cprint(
+                f"\n注意: {r['name']} 也配了 SaaS fallback origin = {r['fallback_origin']}",
+                "yellow",
+            )
+            resp = api("GET", f"/zones/{r['id']}/custom_hostnames?per_page=100")
+            for item in resp.get("result") or []:
+                cprint(
+                    f"  - 非本脚本管理: {item.get('hostname')} status={item.get('status')}"
+                    f" ssl={(item.get('ssl') or {}).get('status')}",
+                    "yellow",
+                )
+
+    cprint(
+        f"\n当前优选入口: {PREFERRED_ENTRY} -> {get_current_preferred_target()}",
+        "cyan",
+    )
+    example = next((r["name"] for r in rows if r["usable"]), AUX_ZONE_NAME)
+    cprint("\n====== 下一步 ======", "bold")
+    cprint("  交互新增（从上表里挑）: cf-tunnel-accel add", "cyan")
+    cprint(f"  只给 zone 再挑子域名:  cf-tunnel-accel add {example}", "cyan")
+    cprint(
+        f"  完整写法:              cf-tunnel-accel add app.{example} 127.0.0.1:8080",
+        "cyan",
+    )
+    cprint(
+        "  域名不在本账号:        cf-tunnel-accel add x.example.com 127.0.0.1:8080 --external",
+        "cyan",
+    )
+    return 0
+
+
+def print_env() -> int:
+    """打印当前生效的基础设施配置（换服务器部署时用来核对）。"""
+    env_token = any(
+        os.environ.get(name, "").strip()
+        for name in ("CF_TUNNEL_ACCEL_API_TOKEN", "CF_API_TOKEN")
+    )
+    if env_token:
+        token_src = "环境变量 ✓"
+    elif CF_API_TOKEN:
+        token_src = f"文件 {TOKEN_FILE} ✓"
+    else:
+        token_src = "未设置 ✗（先配置 Token，见 --help）"
+    items = [
+        ("脚本路径", str(Path(__file__).resolve())),
+        ("API Token", token_src),
+        ("配置覆盖文件", str(ENV_FILE) + ("（存在）" if ENV_FILE.exists() else "（不存在）")),
+        ("ACCOUNT_ID", ACCOUNT_ID),
+        ("TUNNEL_ID", TUNNEL_ID),
+        ("TUNNEL_NAME", TUNNEL_NAME),
+        ("AUX_ZONE", f"{AUX_ZONE_NAME} / {AUX_ZONE_ID}"),
+        ("回退源", FALLBACK_ORIGIN),
+        ("优选入口", PREFERRED_ENTRY),
+        ("默认优选目标", PREFERRED_TARGET),
+        ("隧道配置", str(CONFIG_PATH)),
+        ("systemd 服务", SERVICE_NAME),
+        ("cloudflared", CLOUDFLARED_BIN),
+        ("zone 清单缓存", str(ZONE_CACHE_PATH)),
+        ("zone 数（缓存）", str(len(_zone_info))),
+        ("锁文件", str(LOCK_PATH)),
+    ]
+    cprint(f"\ncf-tunnel-accel {SCRIPT_VERSION} 生效配置", "bold")
+    width = max(len(key) for key, _ in items)
+    for key, value in items:
+        cprint(f"  {key.ljust(width)} = {value}")
+    cprint("\n可用环境变量（写到上面的配置覆盖文件里即可，一键换服务器）:", "cyan")
+    for name in (
+        "CF_TUNNEL_ACCEL_API_TOKEN / CF_API_TOKEN",
+        "CF_TUNNEL_ACCEL_TOKEN_FILE",
+        "CF_TUNNEL_ACCEL_ACCOUNT_ID",
+        "CF_TUNNEL_ACCEL_TUNNEL_ID / CF_TUNNEL_ACCEL_TUNNEL_NAME",
+        "CF_TUNNEL_ACCEL_AUX_ZONE / CF_TUNNEL_ACCEL_AUX_ZONE_ID",
+        "CF_TUNNEL_ACCEL_FALLBACK_ORIGIN / CF_TUNNEL_ACCEL_PREFERRED_ENTRY",
+        "CF_TUNNEL_ACCEL_PREFERRED_TARGET / CF_TUNNEL_ACCEL_CDN_CANDIDATES",
+        "CF_TUNNEL_ACCEL_CONFIG / CF_TUNNEL_ACCEL_SERVICE / CF_TUNNEL_ACCEL_CLOUDFLARED",
+        "CF_TUNNEL_ACCEL_ENV_FILE / CF_TUNNEL_ACCEL_KNOWN_ZONES",
+        "CF_TUNNEL_ACCEL_ZONE_CACHE / CF_TUNNEL_ACCEL_ZONE_CACHE_TTL",
+        "CF_TUNNEL_ACCEL_CDN_MIN_IMPROVEMENT / CF_TUNNEL_ACCEL_API_RETRIES",
+    ):
+        cprint(f"  {name}")
+    cprint(f"\n配置覆盖文件示例（{ENV_FILE}）:", "cyan")
+    cprint("  CF_TUNNEL_ACCEL_TUNNEL_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+    cprint("  CF_TUNNEL_ACCEL_CONFIG=/root/.cloudflared/config-home.yml")
+    return 0
+
+def _confirm_hostname_choice(host: str, zone_id: str) -> Optional[str]:
+    """创建 CNAME 会清掉同名其它类型记录，覆盖前先让用户确认。"""
+    if not zone_id:
+        return host
+    try:
+        recs = list_dns(zone_id, host)
+    except Exception as exc:
+        cprint(f"警告: 读取 {host} 现有解析失败: {exc}", "yellow")
+        return host
+    if not recs:
+        return host
+    cprint(f"注意: {host} 已有解析记录，新增加速会用 CNAME 覆盖同名的 A/AAAA 等记录:", "yellow")
+    for r in recs:
+        cprint(
+            f"  - {str(r.get('type')):6s} {r.get('name')} -> {r.get('content')}"
+            f" proxied={r.get('proxied')}",
+            "yellow",
+        )
+    return host if prompt_yes_no(f"确认用 {host} 覆盖以上记录？", False) else None
+
+
+def _pick_subdomain(zone_name: str) -> Optional[str]:
+    """在指定 zone 里挑一个子域名，列出已用主机名避免撞车。"""
+    meta = _zone_info.get(zone_name) or {}
+    zid = str(meta.get("id") or _zone_cache.get(zone_name) or "")
+    existing: Dict[str, str] = {}
+    for host, service in tunnel_routes():
+        if zone_of_host(host) == zone_name:
+            existing[host] = service
+    try:
+        for item in list_custom_hostnames():
+            host = str(item.get("hostname") or "").lower()
+            if zone_of_host(host) == zone_name:
+                existing.setdefault(
+                    host,
+                    "SaaS status=%s ssl=%s"
+                    % (item.get("status"), (item.get("ssl") or {}).get("status")),
+                )
+    except Exception as exc:
+        cprint(f"警告: 读取 SaaS 主机名失败: {exc}", "yellow")
+
+    cprint(f"\n已选 zone: {zone_name}", "bold")
+    if existing:
+        cprint(f"该 zone 已在用的主机名（{len(existing)} 个）:", "cyan")
+        for host in sorted(existing):
+            cprint(f"  - {host:<34} {existing[host]}")
+    else:
+        cprint("该 zone 还没有加速中的主机名。", "cyan")
+    labels = {host.split(".")[0] for host in existing}
+    hints = [f"{prefix}.{zone_name}" for prefix in HOSTNAME_HINTS if prefix not in labels]
+    if hints:
+        cprint(f"可用示例: {', '.join(hints[:5])}", "cyan")
+    while True:
+        tip = hints[0] if hints else f"app.{zone_name}"
+        raw_line = read_line(f"子域名（@ = 根域名，回车取消，例如 {tip}）: ")
+        if raw_line is None:
+            return None
+        raw = raw_line.strip().lower().strip(".")
+        if not raw:
+            return None
+        if raw in ("@", zone_name):
+            host = zone_name
+        elif raw.endswith("." + zone_name):
+            host = raw
+        else:
+            host = f"{raw}.{zone_name}"
+        if not HOST_RE.match(host):
+            cprint(f"域名格式不正确: {host}", "yellow")
+            continue
+        if host in existing:
+            cprint(f"{host} 已经在用（{existing[host]}）；换个前缀，或先 del 再新增。", "yellow")
+            continue
+        return _confirm_hostname_choice(host, zid)
+
+
+def choose_hostname_interactive(query: str = "") -> Optional[str]:
+    """从账号内的 zone 列表里挑域名；query 可以是 zone 名、完整域名或子域前缀。"""
+    wanted = str(query).strip().lower().rstrip(".")
+    pending_label = ""
+    if wanted:
+        if HOST_RE.match(wanted):
+            zone_name = zone_of_host(wanted)
+            if zone_name is None:
+                try:
+                    ensure_zone_cache()
+                except Exception:
+                    pass
+                zone_name = zone_of_host(wanted)
+            if zone_name == wanted:
+                return _pick_subdomain(zone_name)
+            if zone_name:
+                return _confirm_hostname_choice(wanted, _zone_cache.get(zone_name, ""))
+            cprint(f"{wanted} 不在本账号任何 zone 下（自动配置需要本账号 DNS 权限）。", "yellow")
+            if prompt_yes_no("按手动 DNS 模式继续（稍后自己加解析）？", False):
+                return wanted
+            return None
+        pending_label = wanted.split(".")[-1]
+
+    rows = build_zone_inventory(refresh=True, with_dns=False)
+    if not rows:
+        raise CFError("账号里没有读到任何 zone，请检查 Token 权限（需要 Zone:Read）")
+    cprint("\n选择业务域名所属 zone:", "bold")
+    numbered: List[dict] = []
+    for r in rows:
+        if not r["usable"]:
+            cprint(f"   --  {r['name']:<26} ✗ {'；'.join(r['reasons'])}", "red")
+            continue
+        numbered.append(r)
+        tag = "辅助域" if r["is_aux"] else "业务域"
+        used = f"已用 {len(r['hostnames'])}" if r["hostnames"] else "未使用"
+        cprint(f"  {len(numbered):<3} {r['name']:<26} {tag}  {used}")
+    cprint("   0   取消（也可以直接输入完整域名）")
+    raw_line = read_line("输入序号或域名: ")
+    if raw_line is None:
+        return None
+    raw = raw_line.strip()
+    if not raw or raw == "0":
+        return None
+    if raw.isdigit():
+        idx = int(raw)
+        if not (1 <= idx <= len(numbered)):
+            cprint("序号超出范围", "yellow")
+            return None
+        zone_name = numbered[idx - 1]["name"]
+    else:
+        return choose_hostname_interactive(raw)
+    if pending_label:
+        host = f"{pending_label}.{zone_name}"
+        return _confirm_hostname_choice(host, _zone_cache.get(zone_name, ""))
+    return _pick_subdomain(zone_name)
+
+
+load_zone_cache_file()
+
+def list_dns(zone_id: str, name: Optional[str] = None) -> List[dict]:
+    items: List[dict] = []
+    page = 1
+    while True:
+        q = f"/zones/{zone_id}/dns_records?per_page=100&page={page}"
+        if name:
+            q += f"&name={urllib.parse.quote(name, safe='')}"
+        resp = api_ok(api("GET", q), "读取 DNS")
+        batch = resp.get("result") or []
+        items.extend(batch)
+        info = resp.get("result_info") or {}
+        total_pages = int(info.get("total_pages") or 1)
+        if page >= total_pages or not batch:
+            break
+        page += 1
+    return items
+
+
+def upsert_dns(
+    zone_id: str,
+    rtype: str,
+    name: str,
+    content: str,
+    proxied: Optional[bool] = None,
+    ttl: int = 120,
+    comment: str = "",
+) -> dict:
+    recs = list_dns(zone_id, name)
+    body: Dict[str, Any] = {
+        "type": rtype,
+        "name": name,
+        "content": content,
+        "ttl": 1 if proxied else ttl,
+    }
+    if proxied is not None and rtype in ("A", "AAAA", "CNAME"):
+        body["proxied"] = proxied
+    if comment:
+        body["comment"] = comment
+
+    # CNAME 与同名其它类型冲突时，清掉冲突项
+    if rtype == "CNAME":
+        for o in recs:
+            if o["type"] != "CNAME":
+                api_ok(
+                    api("DELETE", f"/zones/{zone_id}/dns_records/{o['id']}"),
+                    f"删除冲突记录 {o['type']} {o['name']}",
+                )
+        recs = [r for r in recs if r["type"] == "CNAME"]
+
+    same = [r for r in recs if r["type"] == rtype]
+    if rtype == "TXT" and same:
+        for s in same:
+            cur = s["content"].strip('"')
+            if cur == content or s["content"] == content:
+                return s
+        # 同名 TXT 可以合法存在多条；新增验证值，不覆盖 SPF/旧验证值。
+        return api_ok(
+            api("POST", f"/zones/{zone_id}/dns_records", body),
+            f"创建 TXT {name}",
+        )["result"]
+
+    if same:
+        current = same[0]
+        content_same = str(current.get("content", "")).rstrip(".") == content.rstrip(".")
+        proxy_same = (
+            proxied is None
+            or rtype not in ("A", "AAAA", "CNAME")
+            or bool(current.get("proxied")) == proxied
+        )
+        if content_same and proxy_same:
+            return current
+        rid = same[0]["id"]
+        return api_ok(
+            api("PUT", f"/zones/{zone_id}/dns_records/{rid}", body),
+            f"更新 {rtype} {name}",
+        )["result"]
+
+    return api_ok(
+        api("POST", f"/zones/{zone_id}/dns_records", body),
+        f"创建 {rtype} {name}",
+    )["result"]
+
+
+def delete_dns_name(zone_id: str, name: str, types: Optional[List[str]] = None) -> int:
+    recs = list_dns(zone_id, name)
+    n = 0
+    for r in recs:
+        if types and r["type"] not in types:
+            continue
+        api_ok(api("DELETE", f"/zones/{zone_id}/dns_records/{r['id']}"), f"删除 {r['type']} {name}")
+        n += 1
+    return n
+
+
+# =========================
+# SaaS helpers
+# =========================
+def ensure_fallback_origin() -> None:
+    resp = api("GET", f"/zones/{AUX_ZONE_ID}/custom_hostnames/fallback_origin")
+    cur = (resp.get("result") or {}).get("origin")
+    status = (resp.get("result") or {}).get("status")
+    if cur == FALLBACK_ORIGIN and status == "active":
+        cprint(f"回退源已就绪: {FALLBACK_ORIGIN}", "green")
+        return
+    api_ok(
+        api(
+            "PUT",
+            f"/zones/{AUX_ZONE_ID}/custom_hostnames/fallback_origin",
+            {"origin": FALLBACK_ORIGIN},
+        ),
+        "设置回退源",
+    )
+    cprint(f"已设置回退源: {FALLBACK_ORIGIN}", "green")
+
+
+def ensure_preferred_entry_dns() -> None:
+    # origin 由 tunnel 管理，这里确保 cdn 优选入口存在；保留已切换过的目标
+    # 读取失败时宁可停止，不能把现有的优选目标静默改回默认值。
+    current = get_current_preferred_target(strict=True)
+    target = current or PREFERRED_TARGET
+    upsert_dns(
+        AUX_ZONE_ID,
+        "CNAME",
+        PREFERRED_ENTRY,
+        target,
+        proxied=False,
+        ttl=120,
+        comment="preferred CF entry",
+    )
+    cprint(f"优选入口已就绪: {PREFERRED_ENTRY} -> {target} (关黄云)", "green")
+
+
+
+def list_custom_hostnames() -> List[dict]:
+    items: List[dict] = []
+    page = 1
+    while True:
+        resp = api_ok(
+            api("GET", f"/zones/{AUX_ZONE_ID}/custom_hostnames?per_page=50&page={page}"),
+            "列出自定义主机名",
+        )
+        batch = resp.get("result") or []
+        items.extend(batch)
+        info = resp.get("result_info") or {}
+        total_pages = int(info.get("total_pages") or 1)
+        if page >= total_pages or not batch:
+            break
+        page += 1
+    return items
+
+def get_custom_hostname(hostname: str) -> Optional[dict]:
+    for item in list_custom_hostnames():
+        if item.get("hostname") == hostname:
+            return item
+    return None
+
+
+def create_or_get_custom_hostname(hostname: str) -> dict:
+    existing = get_custom_hostname(hostname)
+    if existing:
+        return existing
+    resp = api_ok(
+        api(
+            "POST",
+            f"/zones/{AUX_ZONE_ID}/custom_hostnames",
+            {
+                "hostname": hostname,
+                "ssl": {
+                    "method": "txt",
+                    "type": "dv",
+                    "settings": {"min_tls_version": "1.2"},
+                },
+            },
+        ),
+        f"创建自定义主机名 {hostname}",
+    )
+    return resp["result"]
+
+
+def refresh_custom_hostname(chid: str) -> dict:
+    resp = api_ok(
+        api("GET", f"/zones/{AUX_ZONE_ID}/custom_hostnames/{chid}"),
+        "刷新自定义主机名",
+    )
+    return resp["result"]
+
+
+def delete_custom_hostname(hostname: str) -> bool:
+    item = get_custom_hostname(hostname)
+    if not item:
+        return False
+    api_ok(
+        api("DELETE", f"/zones/{AUX_ZONE_ID}/custom_hostnames/{item['id']}"),
+        f"删除自定义主机名 {hostname}",
+    )
+    return True
+
+
+def apply_saas_validation_records(hostname: str, ch: dict, zone_id: Optional[str]) -> None:
+    """把 SaaS 验证记录写进业务域名所在 zone。
+
+    zone_id 为 None 表示域名不在本账号（--external 模式），此时只列出手工记录。
+    """
+    records: List[Tuple[str, str, str]] = []  # (type, name, value)
+    own = ch.get("ownership_verification") or {}
+    if own.get("name") and own.get("value"):
+        records.append(("TXT", own["name"], own["value"]))
+    ssl = ch.get("ssl") or {}
+    dcv = ssl.get("dcv_delegation_records") or []
+    if dcv:
+        for d in dcv:
+            records.append((d.get("type", "CNAME"), d["cname"], d["cname_target"]))
+    else:
+        for v in ssl.get("validation_records") or []:
+            if v.get("txt_name") and v.get("txt_value"):
+                records.append(("TXT", v["txt_name"], v["txt_value"]))
+            if v.get("cname") and v.get("cname_target"):
+                records.append(("CNAME", v["cname"], v["cname_target"]))
+    if not records:
+        return
+    if not zone_id:
+        cprint(f"\n{hostname} 不在本账号，需要在域名 DNS 处手动添加以下验证记录:", "yellow")
+        for rtype, name, value in records:
+            cprint(f"  {rtype:5s} {name} -> {value}", "yellow")
+        return
+    for rtype, name, value in records:
+        if rtype == "TXT":
+            upsert_dns(zone_id, "TXT", name, value, ttl=120)
+            cprint(f"已写 {rtype}: {name}", "cyan")
+        else:
+            upsert_dns(zone_id, rtype, name, value, proxied=False, ttl=120)
+            cprint(f"已写 {rtype}: {name} -> {value}", "cyan")
+
+
+def wait_custom_hostname_active(chid: str, timeout: int = 420, zone_id: Optional[str] = None, hostname: Optional[str] = None) -> dict:
+    """等待 SaaS 主机名+证书就绪。
+
+    关键修复：创建后立刻拉状态时，DCV/ACME 记录可能还没生成；
+    因此在等待循环里持续补写 ownership / DCV / ACME 验证记录。
+    """
+    start = time.time()
+    last: dict = {}
+    applied_keys = set()
+    while time.time() - start < timeout:
+        last = refresh_custom_hostname(chid)
+        status = last.get("status")
+        ssl = last.get("ssl") or {}
+        ssl_status = ssl.get("status")
+        errs = last.get("verification_errors") or []
+        cprint(f"  状态: hostname={status}, ssl={ssl_status}, errors={errs}", "blue")
+
+        # 持续补验证记录（尤其是刚创建时还没有 dcv 的情况）
+        if zone_id:
+            try:
+                # ownership
+                own = last.get("ownership_verification") or {}
+                if own.get("name") and own.get("value"):
+                    key = f"own:{own['name']}:{own['value']}"
+                    if key not in applied_keys:
+                        upsert_dns(zone_id, "TXT", own["name"], own["value"], ttl=120)
+                        applied_keys.add(key)
+                        cprint(f"  补写 ownership: {own['name']}", "cyan")
+                # DCV CNAME 优先
+                dcv = ssl.get("dcv_delegation_records") or []
+                if dcv:
+                    for d in dcv:
+                        key = f"dcv:{d.get('cname')}:{d.get('cname_target')}"
+                        if key not in applied_keys:
+                            upsert_dns(
+                                zone_id,
+                                d.get("type", "CNAME"),
+                                d["cname"],
+                                d["cname_target"],
+                                proxied=False,
+                                ttl=120,
+                            )
+                            applied_keys.add(key)
+                            cprint(f"  补写 DCV: {d['cname']} -> {d['cname_target']}", "cyan")
+                else:
+                    # 回退 TXT 验证
+                    for v in ssl.get("validation_records") or []:
+                        if v.get("txt_name") and v.get("txt_value"):
+                            key = f"txt:{v['txt_name']}:{v['txt_value']}"
+                            if key not in applied_keys:
+                                upsert_dns(zone_id, "TXT", v["txt_name"], v["txt_value"], ttl=120)
+                                applied_keys.add(key)
+                                cprint(f"  补写 ACME TXT: {v['txt_name']}", "cyan")
+                    # 部分返回顶层 txt_name/txt_value
+                    if ssl.get("txt_name") and ssl.get("txt_value"):
+                        key = f"txt:{ssl['txt_name']}:{ssl['txt_value']}"
+                        if key not in applied_keys:
+                            upsert_dns(zone_id, "TXT", ssl["txt_name"], ssl["txt_value"], ttl=120)
+                            applied_keys.add(key)
+                            cprint(f"  补写 ACME TXT: {ssl['txt_name']}", "cyan")
+            except Exception as e:
+                cprint(f"  补写验证记录时警告: {e}", "yellow")
+
+        if status == "active" and ssl_status in (
+            "active",
+            "pending_issuance",
+            "pending_deployment",
+        ):
+            if ssl_status == "active":
+                return last
+            # 证书签发中，稍等更稳
+            if time.time() - start > 45:
+                return last
+        time.sleep(10)
+    raise CFError(
+        "等待自定义主机名/证书 Active 超时。"
+        f" hostname={last.get('status')} ssl={(last.get('ssl') or {}).get('status')} detail={last}"
+    )
+
+
+# =========================
+# Tunnel config helpers
+# =========================
+def atomic_write_text(path: Path, text: str) -> None:
+    """以临时文件 + fsync + replace 写入，避免进程中断留下半份 YAML。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o600
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def backup_config() -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    bak = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + f".bak.{ts}")
+    shutil.copy2(CONFIG_PATH, bak)
+    return bak
+
+
+def parse_ingress_hostnames(text: str) -> List[Tuple[str, str]]:
+    """返回 [(hostname, service), ...]，不含 catch-all。"""
+    lines = text.splitlines()
+    items: List[Tuple[str, str]] = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^  - hostname:\s*(\S+)(?:\s+#.*)?\s*$", lines[i])
+        if m:
+            host = m.group(1)
+            service = ""
+            # YAML 属性允许夹杂空行/注释，查到下一个同级 ingress 项为止。
+            j = i + 1
+            while j < len(lines):
+                candidate = lines[j]
+                if re.match(r"^  - (?:hostname|service):", candidate):
+                    break
+                m2 = re.match(r"^    service:\s*(\S+)(?:\s+#.*)?\s*$", candidate)
+                if m2:
+                    service = m2.group(1)
+                    break
+                j += 1
+            items.append((host, service))
+        i += 1
+    return items
+
+
+def _has_ingress_hostname(lines: List[str], hostname: str) -> bool:
+    pattern = re.compile(rf"^  - hostname:\s*{re.escape(hostname)}\s*(?:#.*)?$")
+    return any(pattern.match(line) for line in lines)
+
+
+def _ensure_fallback_ingress(lines: List[str]) -> bool:
+    """确保 fallback ingress 存在，返回是否改动了 lines。"""
+    if _has_ingress_hostname(lines, FALLBACK_ORIGIN):
+        return False
+    block = [
+        f"  - hostname: {FALLBACK_ORIGIN}",
+        "    service: http://127.0.0.1:8317",
+        "",
+    ]
+    # 优先放到第一个 hostname 块之后，避免改变 catch-all 的最后规则。
+    for idx, line in enumerate(lines):
+        if line.startswith("  - hostname:"):
+            j = idx + 1
+            while j < len(lines) and (
+                lines[j].startswith("    ") or not lines[j].strip()
+            ):
+                j += 1
+            lines[j:j] = block
+            return True
+    # 没有 hostname 时放到 catch-all 之前。
+    for idx, line in enumerate(lines):
+        if re.match(r"^  - service:\s*", line):
+            lines[idx:idx] = block
+            return True
+    lines.extend(block)
+    return True
+
+
+def upsert_tunnel_hostname(hostname: str, service_url: str) -> bool:
+    """新增/更新 ingress；返回是否真的修改了配置。"""
+    if not CONFIG_PATH.exists():
+        raise CFError(f"找不到隧道配置: {CONFIG_PATH}")
+
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    if "ingress:" not in text:
+        raise CFError("config 中找不到 ingress 段")
+
+    host_line = f"  - hostname: {hostname}"
+    service_line = f"    service: {service_url}"
+
+    lines = text.splitlines()
+    changed = False
+    host_existed = False
+    # 已存在则更新 service
+    for idx, line in enumerate(lines):
+        if re.match(rf"^  - hostname:\s*{re.escape(hostname)}\s*(?:#.*)?$", line):
+            host_existed = True
+            service_idx = None
+            j = idx + 1
+            while j < len(lines):
+                if re.match(r"^  - (?:hostname|service):", lines[j]):
+                    break
+                if re.match(r"^    service:\s*", lines[j]):
+                    service_idx = j
+                    break
+                j += 1
+            if service_idx is not None:
+                if lines[service_idx] != service_line:
+                    lines[service_idx] = service_line
+                    changed = True
+            else:
+                lines.insert(idx + 1, service_line)
+                changed = True
+            break
+    else:
+        # 新插入：放在 catch-all 前。
+        insert_at = None
+        for idx, line in enumerate(lines):
+            if re.match(r"^  - service:\s*", line) and "hostname:" not in line:
+                insert_at = idx
+                break
+        if insert_at is None:
+            lines.extend([host_line, service_line])
+        else:
+            lines[insert_at:insert_at] = [host_line, service_line, ""]
+        changed = True
+
+    if _ensure_fallback_ingress(lines):
+        changed = True
+        cprint(f"已自动补回退源: {FALLBACK_ORIGIN}", "yellow")
+
+    if not changed:
+        cprint(f"隧道主机名已存在且无需更新: {hostname} -> {service_url}", "green")
+        return False
+    backup_config()
+    atomic_write_text(CONFIG_PATH, "\n".join(lines) + "\n")
+    action = "更新" if host_existed else "新增"
+    cprint(f"已{action}隧道主机名: {hostname} -> {service_url}", "green")
+    return True
+
+
+def remove_tunnel_hostname(hostname: str) -> bool:
+    if hostname in (FALLBACK_ORIGIN,):
+        raise CFError("不能删除回退源主机名")
+    if not CONFIG_PATH.exists():
+        return False
+    lines = CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+    out: List[str] = []
+    i = 0
+    removed = False
+    while i < len(lines):
+        if re.match(rf"^  - hostname:\s*{re.escape(hostname)}\s*(?:#.*)?$", lines[i]):
+            removed = True
+            i += 1
+            # 跳过该 host 的缩进属性
+            while i < len(lines) and (lines[i].startswith("    ") or lines[i].strip() == ""):
+                # 只跳过紧随其后的属性；空行吃掉一个
+                if lines[i].strip() == "":
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    if removed:
+        backup_config()
+        atomic_write_text(CONFIG_PATH, "\n".join(out) + "\n")
+    return removed
+
+
+def _wait_service_active(timeout: int = 15) -> None:
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        p = run(["systemctl", "is-active", SERVICE_NAME], check=False, timeout=10)
+        last = (p.stdout or "").strip()
+        if last == "active":
+            return
+        time.sleep(1)
+    raise CFError(f"隧道服务未 active: {last or '(无状态)'}")
+
+
+def _validate_and_restart_once() -> None:
+    cprint("校验隧道配置...", "blue")
+    run([CLOUDFLARED_BIN, "--config", str(CONFIG_PATH), "tunnel", "ingress", "validate"])
+    cprint("重启隧道服务...", "blue")
+    run(["systemctl", "restart", SERVICE_NAME])
+    _wait_service_active()
+    cprint(f"隧道服务已运行: {SERVICE_NAME}", "green")
+
+
+def validate_and_restart_tunnel(rollback_text: Optional[str] = None) -> None:
+    """校验并重启；新配置失败时自动恢复调用前的配置。"""
+    try:
+        _validate_and_restart_once()
+    except Exception as exc:
+        if rollback_text is None:
+            raise
+        cprint(f"新 Tunnel 配置未能生效，准备自动回滚: {exc}", "yellow")
+        try:
+            atomic_write_text(CONFIG_PATH, rollback_text)
+            _validate_and_restart_once()
+        except Exception as rollback_exc:
+            raise CFError(
+                f"新配置失败: {exc}; 自动回滚也失败: {rollback_exc}；"
+                f"请检查 {CONFIG_PATH}"
+            ) from None
+        raise CFError(f"新配置未能生效，已自动回滚: {exc}") from None
+
+
+def ensure_origin_dns() -> None:
+    # 确保 origin CNAME 指向本隧道并开黄云
+    upsert_dns(
+        AUX_ZONE_ID,
+        "CNAME",
+        FALLBACK_ORIGIN,
+        f"{TUNNEL_ID}.cfargotunnel.com",
+        proxied=True,
+        comment="saas fallback origin for home tunnel",
+    )
+    cprint(f"回退源 DNS 已就绪: {FALLBACK_ORIGIN} (开黄云)", "green")
+
+
+# =========================
+# 优选 CDN 测速 / 切换
+# =========================
+def get_current_preferred_target(strict: bool = False) -> str:
+    """读取 cdn 入口当前 CNAME 目标。
+
+    strict=True 用于可能产生写操作的路径：API 读取失败时中止，避免以默认值
+    覆盖已经生效的优选目标；展示用途可维持历史兼容，退回静态默认值。
+    """
+    try:
+        recs = list_dns(AUX_ZONE_ID, PREFERRED_ENTRY)
+        for r in recs:
+            if r.get('type') == 'CNAME' and r.get('content'):
+                return r['content'].rstrip('.')
+    except Exception:
+        if strict:
+            raise
+        return PREFERRED_TARGET
+    if strict:
+        # “没有记录”与“读取 API 失败”不同：首次初始化时应允许创建默认入口，
+        # 但网络/API 异常绝不能静默覆盖已有目标。
+        return PREFERRED_TARGET
+    return PREFERRED_TARGET
+
+
+
+def get_dns_record(zone_id: str, name: str, rtype: str = "CNAME") -> Optional[dict]:
+    """从 Cloudflare API 读取一条记录（避免本地 DNS 缓存误判）。"""
+    for r in list_dns(zone_id, name):
+        if r.get("type") == rtype:
+            return r
+    return None
+
+
+def get_dns_record_content(zone_id: str, name: str, rtype: str = "CNAME") -> Optional[str]:
+    record = get_dns_record(zone_id, name, rtype)
+    if record and record.get("content"):
+        return str(record["content"]).rstrip(".")
+    return None
+
+
+def wait_dns_cname(zone_id: str, name: str, expect: str, timeout: int = 90) -> str:
+    """轮询 API，直到 CNAME 变成期望值。"""
+    expect = expect.rstrip(".")
+    start = time.time()
+    last = ""
+    while time.time() - start < timeout:
+        last = get_dns_record_content(zone_id, name, "CNAME") or ""
+        if last == expect:
+            return last
+        time.sleep(2)
+    raise CFError(f"等待 DNS CNAME 生效超时: {name} 当前={last or '(空)'} 期望={expect}")
+
+
+def probe_local_backend(
+    service_url: str, timeout: int = 5, host_header: Optional[str] = None
+) -> Tuple[bool, str]:
+    """探测本地后端，返回 (是否可用, 简短原因)。
+
+    先发一个 HEAD；任何 HTTP 状态码都说明服务端口和 HTTP 栈在线，失败时
+    再回退 TCP。相比 HEAD+GET 双请求，这样不会在新增/批量诊断时放大业务流量。
+    """
+    if service_url.startswith("http_status:"):
+        return True, service_url
+    url = service_url if service_url.endswith("/") else service_url + "/"
+    last_err = ""
+    headers = {"User-Agent": f"cf-tunnel-accel/{SCRIPT_VERSION}/health"}
+    # 本地反向代理常依据 Host 路由；保留原始业务域名才能测到真实 ingress。
+    if host_header:
+        headers["Host"] = host_header
+
+    for method in ("HEAD", "GET"):
+        try:
+            req = urllib.request.Request(
+                url,
+                method=method,
+                headers=headers,
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    code = getattr(resp, "status", None) or resp.getcode()
+            except urllib.error.HTTPError as exc:
+                # 401/403/404/405/5xx 仍然说明后端在线。
+                code = exc.code
+            note = f"HTTP {code} ({method})"
+            if int(code) >= 400:
+                note += "（业务状态码已忽略）"
+            # 很多 API 不实现 HEAD；用 GET 复核，避免把 405/501 误判成异常。
+            if method == "HEAD" and int(code) in (405, 501):
+                continue
+            return True, note
+        except Exception as exc:
+            last_err = str(exc)
+
+    try:
+        parsed = urllib.parse.urlparse(
+            service_url if "://" in service_url else f"http://{service_url}"
+        )
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if (parsed.scheme or "http") == "https" else 80)
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True, f"TCP {host}:{port} 可达（HTTP 探测失败，按端口放行）"
+    except Exception as exc:
+        last_err = f"{last_err}; TCP: {exc}"
+    return False, last_err or "未知错误"
+
+
+def check_local_backend(
+    service_url: str, timeout: int = 5, host_header: Optional[str] = None
+) -> None:
+    """配置前检查本地后端，避免隧道建好但业务 502。"""
+    ok, detail = probe_local_backend(service_url, timeout=timeout, host_header=host_header)
+    if ok:
+        cprint(f"本地后端探活: {service_url} -> {detail}", "green")
+        return
+    raise CFError(f"本地后端不可达: {service_url}; 错误: {detail}")
+
+
+def backend_status_code(detail: str) -> Optional[int]:
+    match = re.search(r"\bHTTP\s+(\d{3})\b", detail)
+    return int(match.group(1)) if match else None
+
+
+def verify_https(hostname: str, timeout: int = 25) -> Tuple[bool, str]:
+    """HTTPS 验收：公共 DNS + curl 响应头。"""
+    dig = run(["dig", "+short", "@1.1.1.1", "CNAME", hostname], check=False)
+    diga = run(["dig", "+short", "@1.1.1.1", hostname], check=False)
+    curl = run(
+        [
+            "curl",
+            "-sI",
+            "--noproxy",
+            "*",
+            "--max-time",
+            str(timeout),
+            "--connect-timeout",
+            "10",
+            "-L",
+            f"https://{hostname}/",
+        ],
+        check=False,
+    )
+    head = "\n".join((curl.stdout or "").splitlines()[:12])
+    detail = (
+        f"公共DNS CNAME:\n{(dig.stdout or '').strip() or '(空)'}\n"
+        f"公共DNS 解析:\n{(diga.stdout or '').strip() or '(空)'}\n"
+        f"HTTPS 响应头:\n{head or '(空)'}\n"
+        f"curl_exit={curl.returncode}"
+    )
+    ok = False
+    for line in (curl.stdout or "").splitlines():
+        if line.upper().startswith("HTTP/"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                code = int(parts[1])
+                if 200 <= code < 500:
+                    ok = True
+            break
+    return ok, detail
+
+
+def set_preferred_target(target: str, note: str = "") -> dict:
+    global PREFERRED_TARGET
+    target = normalize_cdn_target(target)
+    rec = upsert_dns(
+        AUX_ZONE_ID,
+        'CNAME',
+        PREFERRED_ENTRY,
+        target,
+        proxied=False,
+        ttl=120,
+        comment=note or f"preferred CDN switched at {datetime.now().isoformat(timespec='seconds')}",
+    )
+    confirmed = wait_dns_cname(AUX_ZONE_ID, PREFERRED_ENTRY, target, timeout=30)
+    if confirmed != target:
+        raise CFError(
+            f"优选 CDN 切换未被 API 确认: {PREFERRED_ENTRY} -> {confirmed or '(空)'} "
+            f"（期望 {target}）"
+        )
+    PREFERRED_TARGET = target
+    cprint(f"已切换优选 CDN: {PREFERRED_ENTRY} -> {target} (关黄云)", 'green')
+    return rec
+
+
+def dig_ips(domain: str, limit: int = 8) -> List[str]:
+    ips: List[str] = []
+    seen = set()
+    for rtype in ("A", "AAAA"):
+        p = run(['dig', '+short', rtype, domain], check=False, timeout=15)
+        for line in (p.stdout or '').splitlines():
+            line = line.strip().rstrip('.')
+            try:
+                ipaddress.ip_address(line)
+            except ValueError:
+                continue
+            if line not in seen:
+                seen.add(line)
+                ips.append(line)
+    return ips[:limit]
+
+
+def ping_ip(ip: str, count: int = 4) -> Tuple[List[float], Optional[int]]:
+    if shutil.which('ping') is None:
+        return [], None
+    try:
+        command = ['ping']
+        if ':' in ip:
+            command.append('-6')
+        p = subprocess.run(
+            command + ['-c', str(count), '-W', '1', ip],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        times = [float(x) for x in re.findall(r'time=([\d.]+)', p.stdout or '')]
+        loss = None
+        m = re.search(r'(\d+)% packet loss', p.stdout or '')
+        if m:
+            loss = int(m.group(1))
+        return times, loss
+    except Exception:
+        return [], 100
+
+
+def tcp_latency(ip: str, port: int = 443, tries: int = 4, timeout: float = 2.0) -> List[float]:
+    vals: List[float] = []
+    for _ in range(tries):
+        t0 = time.perf_counter()
+        try:
+            # create_connection 自动选择 IPv4/IPv6，避免 AAAA 候选被误判为失败。
+            with socket.create_connection((ip, port), timeout=timeout):
+                pass
+            vals.append((time.perf_counter() - t0) * 1000)
+        except Exception:
+            pass
+    return vals
+
+
+def https_latency(
+    domain: str, ip: str, tries: int = 3, timeout: float = 6.0
+) -> Tuple[List[float], List[float], List[int]]:
+    """用真实 Host/SNI 访问指定 IP，返回 (TLS 完成时间, TTFB, HTTP 状态码)。"""
+    tls_vals: List[float] = []
+    ttfb_vals: List[float] = []
+    statuses: List[int] = []
+    resolve_ip = f"[{ip}]" if ":" in ip else ip
+    for _ in range(tries):
+        p = run(
+            [
+                "curl",
+                "-sS",
+                "-I",
+                "--noproxy",
+                "*",
+                "-o",
+                "/dev/null",
+                "--connect-timeout",
+                str(max(1, int(timeout))),
+                "--max-time",
+                str(max(2, int(timeout))),
+                "--resolve",
+                f"{domain}:443:{resolve_ip}",
+                "-w",
+                "%{http_code} %{time_appconnect} %{time_starttransfer}",
+                f"https://{domain}/",
+            ],
+            check=False,
+            timeout=max(10, int(timeout) + 5),
+        )
+        fields = (p.stdout or "").strip().split()
+        if len(fields) < 3:
+            continue
+        try:
+            status = int(fields[0])
+            tls_ms = float(fields[1]) * 1000
+            ttfb_ms = float(fields[2]) * 1000
+        except ValueError:
+            continue
+        if status <= 0 or tls_ms <= 0:
+            continue
+        statuses.append(status)
+        tls_vals.append(tls_ms)
+        ttfb_vals.append(ttfb_ms)
+    return tls_vals, ttfb_vals, statuses
+
+
+def _benchmark_ip(domain: str, ip: str, ping_count: int, tcp_tries: int) -> dict:
+    times, loss = ping_ip(ip, count=ping_count)
+    tcp = tcp_latency(ip, tries=tcp_tries)
+    tls, ttfb, statuses = https_latency(domain, ip, tries=max(2, min(3, tcp_tries)))
+    return {
+        'ip': ip,
+        'ping_avg': statistics.mean(times) if times else None,
+        'ping_min': min(times) if times else None,
+        'ping_loss': loss,
+        'tcp_avg': statistics.mean(tcp) if tcp else None,
+        'tcp_min': min(tcp) if tcp else None,
+        'tcp_median': statistics.median(tcp) if tcp else None,
+        'tcp_ok': len(tcp),
+        'tcp_tries': tcp_tries,
+        'https_avg': statistics.mean(tls) if tls else None,
+        'https_min': min(tls) if tls else None,
+        'https_median': statistics.median(tls) if tls else None,
+        'ttfb_avg': statistics.mean(ttfb) if ttfb else None,
+        'https_ok': len(tls),
+        'https_tries': max(2, min(3, tcp_tries)),
+        'http_statuses': statuses,
+    }
+
+
+def benchmark_cdn(domain: str, ping_count: int = 4, tcp_tries: int = 4) -> dict:
+    ips = dig_ips(domain)
+    all_ping: List[float] = []
+    all_tcp: List[float] = []
+    all_https: List[float] = []
+    all_ttfb: List[float] = []
+    rows: List[dict] = []
+    if ips:
+        workers = min(8, len(ips))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_benchmark_ip, domain, ip, ping_count, tcp_tries): ip
+                for ip in ips
+            }
+            by_ip: Dict[str, dict] = {}
+            for future in as_completed(futures):
+                ip = futures[future]
+                try:
+                    by_ip[ip] = future.result()
+                except Exception as exc:
+                    by_ip[ip] = {
+                        'ip': ip,
+                        'ping_avg': None,
+                        'ping_min': None,
+                        'ping_loss': 100,
+                        'tcp_avg': None,
+                        'tcp_min': None,
+                        'tcp_median': None,
+                        'tcp_ok': 0,
+                        'tcp_tries': tcp_tries,
+                        'https_avg': None,
+                        'https_min': None,
+                        'https_median': None,
+                        'ttfb_avg': None,
+                        'https_ok': 0,
+                        'https_tries': max(2, min(3, tcp_tries)),
+                        'http_statuses': [],
+                        'error': str(exc),
+                    }
+            rows = [by_ip[ip] for ip in ips]
+    for row in rows:
+        # 只把成功样本纳入聚合统计，避免失败值扭曲平均数。
+        if row.get('ping_avg') is not None:
+            all_ping.append(row['ping_avg'])
+        if row.get('tcp_avg') is not None:
+            all_tcp.append(row['tcp_avg'])
+        if row.get('https_avg') is not None:
+            all_https.append(row['https_avg'])
+        if row.get('ttfb_avg') is not None:
+            all_ttfb.append(row['ttfb_avg'])
+    https_ok = sum(int(r.get('https_ok') or 0) for r in rows)
+    https_tries = sum(int(r.get('https_tries') or 0) for r in rows)
+    tcp_ok = sum(int(r.get('tcp_ok') or 0) for r in rows)
+    tcp_tries_total = sum(int(r.get('tcp_tries') or 0) for r in rows)
+    https_samples = [
+        r['https_median'] for r in rows if r.get('https_median') is not None
+    ]
+    tcp_samples = [
+        r['tcp_median'] for r in rows if r.get('tcp_median') is not None
+    ]
+    return {
+        'domain': domain,
+        'ips': ips,
+        'ip_count': len(ips),
+        'rows': rows,
+        'best_ping': min((r['ping_min'] for r in rows if r['ping_min'] is not None), default=None),
+        'avg_ping': statistics.mean(all_ping) if all_ping else None,
+        'best_tcp': min((r['tcp_min'] for r in rows if r['tcp_min'] is not None), default=None),
+        'avg_tcp': statistics.mean(all_tcp) if all_tcp else None,
+        'median_tcp': statistics.median(tcp_samples) if tcp_samples else None,
+        'best_https': min((r['https_min'] for r in rows if r['https_min'] is not None), default=None),
+        'avg_https': statistics.mean(all_https) if all_https else None,
+        'median_https': statistics.median(https_samples) if https_samples else None,
+        'avg_ttfb': statistics.mean(all_ttfb) if all_ttfb else None,
+        'https_ok': https_ok,
+        'https_tries': https_tries,
+        'https_success_rate': (https_ok / https_tries) if https_tries else 0.0,
+        'tcp_ok': tcp_ok,
+        'tcp_tries': tcp_tries_total,
+        'ping_samples': len(all_ping),
+        'tcp_samples': len(all_tcp),
+    }
+
+
+def rank_cdn_results(results: List[dict]) -> List[dict]:
+    return sorted(
+        results,
+        key=lambda x: (
+            x.get('https_ok', 0) == 0,
+            -(x.get('https_success_rate') or 0.0),
+            x.get('median_https') if x.get('median_https') is not None else 1e9,
+            x.get('avg_ttfb') if x.get('avg_ttfb') is not None else 1e9,
+            x.get('median_tcp') if x.get('median_tcp') is not None else 1e9,
+            x.get('best_ping') if x.get('best_ping') is not None else 1e9,
+        ),
+    )
+
+
+def fmt_ms(v: Optional[float]) -> str:
+    return '-' if v is None else f"{v:.2f}ms"
+
+
+def print_cdn_benchmark(results: List[dict], current: Optional[str] = None) -> List[dict]:
+    ranked = rank_cdn_results(results)
+    cprint('\n====== 优选 CDN 测速结果（本机出口）======', 'bold')
+    for i, r in enumerate(ranked, 1):
+        mark = ''
+        if current and r['domain'] == current:
+            mark = '  [当前]'
+        cprint(
+            f"{i}. {r['domain']}{mark}\n"
+            f"https={fmt_ms(r.get('median_https'))}  TTFB={fmt_ms(r.get('avg_ttfb'))}  "
+            f"可用率={r.get('https_success_rate', 0.0) * 100:.0f}%\n"
+            f"   tcp_best={fmt_ms(r['best_tcp'])}  tcp_median={fmt_ms(r.get('median_tcp'))}  "
+            f"ping_best={fmt_ms(r['best_ping'])}  ips={r['ip_count']}",
+            'green' if i == 1 else None,
+        )
+        for row in r['rows']:
+            loss = '-' if row.get('ping_loss') is None else f"{row['ping_loss']}%"
+            cprint(
+                f"     - {row['ip']:39s} https={fmt_ms(row.get('https_median'))} "
+                f"status={','.join(map(str, row.get('http_statuses') or [])) or '-'} "
+                f"tcp_avg={fmt_ms(row['tcp_avg'])} ok={row['tcp_ok']}/{row['tcp_tries']} "
+                f"ping_avg={fmt_ms(row['ping_avg'])} loss={loss}"
+            )
+    if ranked:
+        cprint(f"\n本机测速最优: {ranked[0]['domain']}", 'green')
+    return ranked
+
+
+def cdn_latency_score(result: dict) -> Optional[float]:
+    """用于比较的稳定延迟：优先 HTTPS 中位数，退化到 TCP 中位数。"""
+    if result.get('median_https') is not None and result.get('https_ok', 0):
+        return float(result['median_https'])
+    if result.get('median_tcp') is not None and result.get('tcp_ok', 0):
+        return float(result['median_tcp'])
+    return None
+
+
+def normalize_cdn_target(raw: str) -> str:
+    target = (raw or '').strip().lower().rstrip('.')
+    if not HOST_RE.match(target):
+        raise CFError(f"优选 CDN 域名格式不正确: {raw}")
+    return target
+
+
+def ensure_candidate_list(extra: Optional[List[str]] = None) -> List[str]:
+    items: List[str] = []
+    for d in list(CDN_CANDIDATES) + list(extra or []):
+        if not d:
+            continue
+        d = normalize_cdn_target(d)
+        if d not in items:
+            items.append(d)
+    current = get_current_preferred_target(strict=True)
+    if current:
+        current = normalize_cdn_target(current)
+        if current not in items:
+            items.insert(0, current)
+    return items
+
+
+def test_and_maybe_switch_cdn(
+    auto_apply_best: bool = False,
+    candidates: Optional[List[str]] = None,
+    interactive: bool = False,
+    force: bool = False,
+) -> Optional[str]:
+    current = get_current_preferred_target(strict=True)
+    domains = candidates or ensure_candidate_list()
+    cprint(f"当前优选 CDN: {current}", 'cyan')
+    cprint(f"候选: {', '.join(domains)}", 'cyan')
+    results = []
+    for d in domains:
+        cprint(f"测速中: {d} ...", 'blue')
+        results.append(benchmark_cdn(d))
+    ranked = print_cdn_benchmark(results, current=current)
+    if not ranked:
+        raise CFError('没有可测速的候选 CDN')
+    usable = [r for r in ranked if cdn_latency_score(r) is not None]
+    if not usable:
+        raise CFError('所有候选 CDN 均未通过 HTTPS/TCP 探测，保持当前配置不变')
+    best = ranked[0]['domain']
+    if auto_apply_best:
+        if best == current:
+            cprint('最优已是当前 CDN，无需切换。', 'green')
+            return current
+        best_result = next(r for r in ranked if r['domain'] == best)
+        current_result = next((r for r in ranked if r['domain'] == current), None)
+        best_score = cdn_latency_score(best_result)
+        current_score = cdn_latency_score(current_result) if current_result else None
+        if (
+            not force
+            and current_score is not None
+            and best_score is not None
+            and current_score > 0
+        ):
+            improvement = (current_score - best_score) / current_score * 100
+            if improvement < CDN_SWITCH_MIN_IMPROVEMENT_PERCENT:
+                cprint(
+                    f'当前 CDN 仍足够稳定（预计仅改善 {improvement:.1f}% < '
+                    f'{CDN_SWITCH_MIN_IMPROVEMENT_PERCENT:.1f}%），不切换。可用 --force 强制切换。',
+                    'green',
+                )
+                return current
+        set_preferred_target(best)
+        return best
+
+    if not interactive:
+        cprint('仅测速，未修改 DNS。需要选择切换请使用交互菜单。', 'cyan')
+        return current
+
+    # 交互选择
+    cprint('\n切换选项:', 'bold')
+    cprint('  0) 不切换，仅查看结果')
+    for i, r in enumerate(ranked, 1):
+        tag = ' (当前最优)' if i == 1 else ''
+        now = ' [当前使用]' if r['domain'] == current else ''
+        cprint(f"  {i}) 切换到 {r['domain']}{tag}{now}")
+    cprint(f"  c) 手动输入其它 CDN 域名")
+    choice = input('请选择: ').strip().lower()
+    if choice in ('', '0'):
+        cprint('未切换。', 'yellow')
+        return current
+    if choice == 'c':
+        custom = prompt('输入优选 CDN 域名').strip().lower().rstrip('.')
+        set_preferred_target(custom)
+        return custom
+    if choice.isdigit() and 1 <= int(choice) <= len(ranked):
+        target = ranked[int(choice) - 1]['domain']
+        if target == current and not prompt_yes_no(f'{target} 已是当前值，仍要重写 DNS 吗？', False):
+            return current
+        set_preferred_target(target)
+        return target
+    raise CFError('无效选择')
+
+
+def interactive_cdn_menu() -> None:
+    current = get_current_preferred_target(strict=True)
+    cprint(f"\n当前: {PREFERRED_ENTRY} -> {current}", 'cyan')
+    cprint('  1) 测速全部候选并选择切换')
+    cprint('  2) 一键测速并自动切到最优')
+    cprint('  3) 直接切换到指定 CDN（不测速）')
+    cprint('  0) 返回')
+    choice = input('输入序号: ').strip()
+    if choice == '1':
+        test_and_maybe_switch_cdn(auto_apply_best=False, interactive=True)
+    elif choice == '2':
+        if prompt_yes_no('确认测速后自动切换到本机最优 CDN？', True):
+            test_and_maybe_switch_cdn(auto_apply_best=True)
+    elif choice == '3':
+        cprint('内置候选:', 'cyan')
+        for i, d in enumerate(CDN_CANDIDATES, 1):
+            cprint(f"  {i}) {d}")
+        raw = prompt('输入序号或完整 CDN 域名')
+        if raw.isdigit() and 1 <= int(raw) <= len(CDN_CANDIDATES):
+            target = CDN_CANDIDATES[int(raw) - 1]
+        else:
+            target = raw
+        set_preferred_target(target)
+    elif choice == '0':
+        return
+    else:
+        cprint('无效选项', 'yellow')
+
+
+# =========================
+# 输入规范化
+# =========================
+def normalize_hostname(raw: str) -> str:
+    host = raw.strip().lower()
+    host = re.sub(r"^https?://", "", host)
+    host = host.split("/")[0].split(":")[0].strip(".")
+    if not HOST_RE.match(host):
+        raise CFError(f"域名格式不正确: {raw}")
+    if host in (FALLBACK_ORIGIN, PREFERRED_ENTRY, AUX_ZONE_NAME):
+        raise CFError("该主机名是系统保留入口，不能作为业务域名")
+    return host
+
+
+def normalize_service(raw: str) -> str:
+    s = raw.strip()
+    # 允许用户输入 8080 / :8080 / 127.0.0.1:8080 / http://ip:port
+    if re.fullmatch(r":?\d{1,5}", s):
+        s = f"127.0.0.1:{s.lstrip(':')}"
+    m = SERVICE_RE.match(s)
+    if not m:
+        raise CFError(
+            "本地服务格式不正确。示例: 127.0.0.1:8080 / localhost:3000 / 192.168.8.1:80"
+        )
+    port = int(m.group("port"))
+    if not (1 <= port <= 65535):
+        raise CFError(f"端口不合法: {port}")
+    scheme = m.group("scheme") or "http://"
+    host = m.group("host")
+    if host == "localhost":
+        host = "127.0.0.1"
+    return f"{scheme}{host}:{port}"
+
+
+# =========================
+# 主流程
+# =========================
+
+def add_accelerated_service(
+    hostname: str, service_url: str, external: bool = False
+) -> None:
+    cprint("\n====== 开始自动配置 ======", "bold")
+    cprint(f"域名: {hostname}", "cyan")
+    cprint(f"后端: {service_url}", "cyan")
+
+    zone = resolve_zone(hostname)
+    if zone is None:
+        if not external:
+            print_domains(show_dns=False)
+            raise CFError(
+                f"{hostname} 不属于本账号任何 Cloudflare zone；"
+                "上面的清单是本账号里能自动配置的域名。"
+                "如果一定要用这个域名（解析手动加），改用: "
+                f"cf-tunnel-accel add {hostname} {service_url} --external"
+            )
+        zone_name, zone_id = "(外部域名)", None
+        cprint("该域名不在本账号：按 --external 手动 DNS 模式继续。", "yellow")
+    else:
+        zone_name, zone_id = zone
+        cprint(f"所属 zone: {zone_name}", "cyan")
+
+    # 0) 本地后端探活，避免“隧道配置成功但访问 502”
+    check_local_backend(service_url, host_header=hostname)
+
+    # 1) 基础入口
+    ensure_origin_dns()
+    ensure_preferred_entry_dns()
+    ensure_fallback_origin()
+    current_cdn = get_current_preferred_target(strict=True)
+
+    # 2) tunnel：配置变更才重启；校验/重启失败自动恢复调用前版本。
+    config_before = CONFIG_PATH.read_text(encoding="utf-8")
+    try:
+        config_changed = upsert_tunnel_hostname(hostname, service_url)
+        # 确保 origin 在 ingress 中，而不是只在注释或其它字段中出现。
+        cfg_lines = CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+        if not _has_ingress_hostname(cfg_lines, FALLBACK_ORIGIN):
+            config_changed = (
+                upsert_tunnel_hostname(FALLBACK_ORIGIN, "http://127.0.0.1:8317")
+                or config_changed
+            )
+        if config_changed:
+            validate_and_restart_tunnel(rollback_text=config_before)
+        else:
+            active, state = _systemd_active()
+            if not active:
+                _validate_and_restart_once()
+            else:
+                cprint("Tunnel 配置未变更，跳过重启。", "cyan")
+    except Exception:
+        # 若配置阶段在校验前就中断，也不要留下半套 ingress。
+        try:
+            if CONFIG_PATH.read_text(encoding="utf-8") != config_before:
+                atomic_write_text(CONFIG_PATH, config_before)
+        except Exception:
+            pass
+        raise
+
+    # 3) SaaS custom hostname
+    cprint("创建/获取 SaaS 自定义主机名...", "blue")
+    ch = create_or_get_custom_hostname(hostname)
+    ch = refresh_custom_hostname(ch["id"])
+    apply_saas_validation_records(hostname, ch, zone_id)
+
+    # 4) 先指到 origin 做激活（必须关黄云，且 CNAME 到 SaaS 区主机名）
+    if zone_id:
+        cprint("临时解析到回退源以完成 SaaS 激活...", "blue")
+        upsert_dns(
+            zone_id,
+            "CNAME",
+            hostname,
+            FALLBACK_ORIGIN,
+            proxied=False,
+            ttl=60,
+            comment="temp for saas activation",
+        )
+        api_cname = wait_dns_cname(zone_id, hostname, FALLBACK_ORIGIN, timeout=60)
+        cprint(f"API 确认激活 CNAME: {hostname} -> {api_cname}", "cyan")
+    else:
+        cprint("\n请在你的域名 DNS 处先添加（关黄云 / DNS only）:", "yellow")
+        cprint(f"  CNAME {hostname} -> {FALLBACK_ORIGIN}", "yellow")
+        if read_line("添加完成后按回车，脚本会等待 SaaS 激活...") is None:
+            raise CFError("输入结束（EOF），已中止；DNS 未改动")
+
+    # 5) 等待 active
+    cprint("等待自定义主机名 Active / 证书签发...", "blue")
+    ch = wait_custom_hostname_active(ch["id"], timeout=420, zone_id=zone_id, hostname=hostname)
+    cprint(
+        f"SaaS 状态: {ch.get('status')}, SSL: {(ch.get('ssl') or {}).get('status')}",
+        "green",
+    )
+
+    # 6) 切到优选入口（关黄云），并强制 API 确认写成功
+    if zone_id:
+        cprint("切换到优选入口...", "blue")
+        upsert_dns(
+            zone_id,
+            "CNAME",
+            hostname,
+            PREFERRED_ENTRY,
+            proxied=False,
+            ttl=120,
+            comment="preferred CF entry via dual-domain saas",
+        )
+        api_cname = wait_dns_cname(zone_id, hostname, PREFERRED_ENTRY, timeout=90)
+        if api_cname != PREFERRED_ENTRY.rstrip("."):
+            raise CFError(
+                f"切换优选入口失败: API CNAME={api_cname} 期望={PREFERRED_ENTRY}"
+            )
+        cprint(f"API 确认优选 CNAME: {hostname} -> {api_cname}", "green")
+    else:
+        cprint("接下来把 DNS 指向优选入口（手动）:", "yellow")
+        cprint(f"  CNAME {hostname} -> {PREFERRED_ENTRY}（关黄云 / DNS only）", "yellow")
+        cprint(f"然后执行: cf-tunnel-accel switch {hostname} 再次确认", "yellow")
+
+    # 7) 验收（公共 DNS + HTTPS；不再只信本机 dig 缓存）
+    cprint("验收中...", "blue")
+    time.sleep(3)
+    ok, detail = verify_https(hostname)
+    cprint(detail)
+    if not ok:
+        cprint(
+            "警告: HTTPS 验收未通过。可能是公共 DNS 尚未刷新，或当前优选 CDN 线路异常。"
+            "可稍后重试，或执行: cf-tunnel-accel cdn best / cf-tunnel-accel switch "
+            + hostname,
+            "yellow",
+        )
+    else:
+        cprint("HTTPS 验收通过", "green")
+
+    cprint("\n====== 完成 ======", "bold")
+    cprint(f"访问: https://{hostname}", "green")
+    cprint(
+        f"链路: {hostname} -> {PREFERRED_ENTRY} -> {current_cdn} -> SaaS -> "
+        f"{FALLBACK_ORIGIN} -> tunnel -> {service_url}",
+        "green",
+    )
+
+
+def remove_service(hostname: str) -> None:
+    cprint(f"\n开始删除业务域名: {hostname}", "bold")
+    if hostname in (FALLBACK_ORIGIN, PREFERRED_ENTRY):
+        raise CFError("系统入口不允许删除")
+
+    # tunnel
+    config_before = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else None
+    if remove_tunnel_hostname(hostname):
+        cprint("已从隧道配置移除", "green")
+        validate_and_restart_tunnel(rollback_text=config_before)
+    else:
+        cprint("隧道配置中未找到该主机名", "yellow")
+
+    # saas
+    if delete_custom_hostname(hostname):
+        cprint("已删除 SaaS 自定义主机名", "green")
+    else:
+        cprint("SaaS 中未找到该主机名", "yellow")
+
+    # dns（外部域名没有自动解析，跳过并提示）
+    zone = resolve_zone(hostname)
+    if zone is None:
+        cprint(
+            f"{hostname} 不在本账号 zone 下，跳过自动 DNS 清理；"
+            "如有手动解析请自行删除。",
+            "yellow",
+        )
+    else:
+        zone_name, zone_id = zone
+        n = 0
+        n += delete_dns_name(zone_id, hostname)
+        n += delete_dns_name(zone_id, f"_cf-custom-hostname.{hostname}")
+        n += delete_dns_name(zone_id, f"_acme-challenge.{hostname}")
+        # 再扫一遍 API，防止遗留同名不同 type
+        leftover = list_dns(zone_id, hostname)
+        leftover += list_dns(zone_id, f"_cf-custom-hostname.{hostname}")
+        leftover += list_dns(zone_id, f"_acme-challenge.{hostname}")
+        for r in leftover:
+            api_ok(
+                api("DELETE", f"/zones/{zone_id}/dns_records/{r['id']}"),
+                f"补删残留 {r['type']} {r['name']}",
+            )
+            n += 1
+        cprint(f"已清理 DNS 共 {n} 条 zone={zone_name}", "green")
+    cprint("删除完成", "green")
+
+def list_all() -> None:
+    cprint("\n====== 隧道主机名 ======", "bold")
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    for host, service in parse_ingress_hostnames(text):
+        mark = " [系统回退源]" if host == FALLBACK_ORIGIN else ""
+        cprint(f"  {host:30s} -> {service}{mark}")
+
+    cprint("\n====== SaaS 自定义主机名 ======", "bold")
+    for item in list_custom_hostnames():
+        cprint(
+            f"  {item.get('hostname'):30s} status={item.get('status')} ssl={(item.get('ssl') or {}).get('status')}"
+        )
+
+    cprint("\n====== 关键 DNS ======", "bold")
+    for zone_name, zone_id in sorted(_zone_cache.items()):
+        if zone_name == AUX_ZONE_NAME:
+            for name in (FALLBACK_ORIGIN, PREFERRED_ENTRY):
+                for r in list_dns(zone_id, name):
+                    extra = ''
+                    if name == PREFERRED_ENTRY:
+                        extra = '  <= 当前优选CDN入口'
+                    cprint(
+                        f"  [{zone_name}] {r['type']:5s} {r['name']:40s} -> {r['content']} proxied={r.get('proxied')}{extra}"
+                    )
+        # 业务域名粗看 CNAME 到 preferred entry 的
+        recs = list_dns(zone_id)
+        for r in recs:
+            if r["type"] == "CNAME" and r.get("content") in (
+                PREFERRED_ENTRY,
+                FALLBACK_ORIGIN,
+                f"{PREFERRED_ENTRY}.",
+                f"{FALLBACK_ORIGIN}.",
+            ):
+                cprint(
+                    f"  [{zone_name}] {r['type']:5s} {r['name']:40s} -> {r['content']} proxied={r.get('proxied')}"
+                )
+
+
+def _systemd_active() -> Tuple[bool, str]:
+    try:
+        p = run(["systemctl", "is-active", SERVICE_NAME], check=False, timeout=10)
+        state = (p.stdout or "").strip() or (p.stderr or "").strip()
+        return state == "active", state or "unknown"
+    except CFError as exc:
+        return False, str(exc)
+
+
+def show_status() -> None:
+    """输出不修改任何资源的简要运行状态，适合人工或脚本快速查看。"""
+    cprint("\n====== cf-tunnel-accel 状态 ======", "bold")
+    active, state = _systemd_active()
+    cprint(
+        f"Tunnel service: {SERVICE_NAME} -> {state}",
+        "green" if active else "red",
+    )
+    if CONFIG_PATH.exists():
+        routes = parse_ingress_hostnames(CONFIG_PATH.read_text(encoding="utf-8"))
+        cprint(f"Tunnel config: {CONFIG_PATH}（{len(routes)} 条 hostname 规则）", "cyan")
+        check = run(
+            [CLOUDFLARED_BIN, "--config", str(CONFIG_PATH), "tunnel", "ingress", "validate"],
+            check=False,
+            timeout=30,
+        )
+        cprint(
+            f"Config validate: {'OK' if check.returncode == 0 else 'FAILED'}",
+            "green" if check.returncode == 0 else "red",
+        )
+    else:
+        cprint(f"Tunnel config: 不存在 {CONFIG_PATH}", "red")
+
+    try:
+        current = get_current_preferred_target(strict=True)
+        cprint(f"Preferred CDN: {PREFERRED_ENTRY} -> {current}", "cyan")
+    except Exception as exc:
+        cprint(f"Preferred CDN: 读取失败: {exc}", "yellow")
+
+    try:
+        items = list_custom_hostnames()
+        active_count = sum(1 for x in items if x.get("status") == "active")
+        cprint(f"SaaS custom hostnames: {active_count}/{len(items)} active", "cyan")
+        for item in items:
+            ssl_status = (item.get("ssl") or {}).get("status") or "-"
+            cprint(f"  - {item.get('hostname')}: {item.get('status')} / ssl={ssl_status}")
+    except Exception as exc:
+        cprint(f"SaaS custom hostnames: 读取失败: {exc}", "yellow")
+
+    journal = run(
+        [
+            "journalctl",
+            "-u",
+            SERVICE_NAME,
+            "-p",
+            "err",
+            "-n",
+            "3",
+            "--no-pager",
+            "-o",
+            "cat",
+        ],
+        check=False,
+        timeout=10,
+    )
+    errors = [line.strip() for line in (journal.stdout or "").splitlines() if line.strip()]
+    if errors:
+        cprint("最近 Tunnel 错误:", "yellow")
+        for line in errors[-3:]:
+            cprint(f"  {line}", "yellow")
+
+
+def check_auxiliary_chain() -> int:
+    """检查双域名方案的两个辅助入口及 SaaS fallback 配置。"""
+    failures = 0
+    cprint("辅助链路:", "cyan")
+    expected_origin = f"{TUNNEL_ID}.cfargotunnel.com"
+    try:
+        origin = get_dns_record(AUX_ZONE_ID, FALLBACK_ORIGIN, "CNAME")
+        origin_content = str((origin or {}).get("content") or "").rstrip(".")
+        origin_ok = (
+            origin is not None
+            and origin_content == expected_origin.rstrip(".")
+            and bool(origin.get("proxied"))
+        )
+        cprint(
+            f"  {'PASS' if origin_ok else 'FAIL'} {FALLBACK_ORIGIN} -> "
+            f"{origin_content or '(空)'} proxied={bool((origin or {}).get('proxied'))}",
+            "green" if origin_ok else "red",
+        )
+        if not origin_ok:
+            failures += 1
+    except Exception as exc:
+        cprint(f"  FAIL 回退源 DNS 检查: {exc}", "red")
+        failures += 1
+
+    try:
+        entry = get_dns_record(AUX_ZONE_ID, PREFERRED_ENTRY, "CNAME")
+        target = str((entry or {}).get("content") or "").rstrip(".")
+        entry_ok = entry is not None and bool(target) and not bool(entry.get("proxied"))
+        cprint(
+            f"  {'PASS' if entry_ok else 'FAIL'} {PREFERRED_ENTRY} -> "
+            f"{target or '(空)'} proxied={bool((entry or {}).get('proxied'))}",
+            "green" if entry_ok else "red",
+        )
+        if not entry_ok:
+            failures += 1
+    except Exception as exc:
+        cprint(f"  FAIL 优选入口 DNS 检查: {exc}", "red")
+        failures += 1
+
+    try:
+        fallback = api_ok(
+            api("GET", f"/zones/{AUX_ZONE_ID}/custom_hostnames/fallback_origin"),
+            "读取 SaaS fallback origin",
+        ).get("result") or {}
+        fallback_ok = (
+            fallback.get("origin") == FALLBACK_ORIGIN
+            and fallback.get("status") == "active"
+        )
+        cprint(
+            f"  {'PASS' if fallback_ok else 'FAIL'} SaaS fallback origin: "
+            f"{fallback.get('origin') or '(空)'} / {fallback.get('status') or '-'}",
+            "green" if fallback_ok else "red",
+        )
+        if not fallback_ok:
+            failures += 1
+    except Exception as exc:
+        cprint(f"  FAIL SaaS fallback 检查: {exc}", "red")
+        failures += 1
+    return failures
+
+
+def health_check(hostname: Optional[str] = None, include_https: bool = False) -> bool:
+    """检查 Tunnel 服务、配置、每条本地后端及 SaaS/DNS 链路。"""
+    cprint("\n====== Tunnel 全链路健康检查 ======", "bold")
+    failures = 0
+    if not CONFIG_PATH.exists():
+        cprint(f"FAIL config 不存在: {CONFIG_PATH}", "red")
+        return False
+
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    routes = parse_ingress_hostnames(text)
+    if hostname:
+        routes = [(h, s) for h, s in routes if h == hostname]
+        if not routes:
+            cprint(f"FAIL 配置中找不到 hostname: {hostname}", "red")
+            return False
+
+    active, state = _systemd_active()
+    cprint(
+        f"{'PASS' if active else 'FAIL'} systemd {SERVICE_NAME}: {state}",
+        "green" if active else "red",
+    )
+    if not active:
+        failures += 1
+
+    validation = run(
+        [CLOUDFLARED_BIN, "--config", str(CONFIG_PATH), "tunnel", "ingress", "validate"],
+        check=False,
+        timeout=30,
+    )
+    valid = validation.returncode == 0
+    cprint(
+        f"{'PASS' if valid else 'FAIL'} cloudflared ingress validate",
+        "green" if valid else "red",
+    )
+    if not valid:
+        failures += 1
+
+    # 只有全量检查时才校验公共辅助链路；单域名检查保持快速。
+    if hostname is None:
+        failures += check_auxiliary_chain()
+
+    custom_by_host: Dict[str, dict] = {}
+    custom_error = ""
+    try:
+        custom_by_host = {
+            str(item.get("hostname")): item for item in list_custom_hostnames()
+        }
+    except Exception as exc:
+        custom_error = str(exc)
+        cprint(f"WARN SaaS 状态读取失败: {exc}", "yellow")
+        # 无法读取 SaaS 状态时不能把整条链路误报为健康。
+        failures += 1
+
+    for host, service in routes:
+        if service.startswith("http_status:"):
+            cprint(f"PASS {host} -> {service}（catch-all/内置响应）", "green")
+            continue
+        if host == FALLBACK_ORIGIN:
+            # fallback origin 是按业务 Host 分发的本地路由器；直接以
+            # origin.v50kkp.eu.org 访问得到 502 属于预期，实际可用性由下方
+            # 各业务 hostname 的探测以及辅助链路检查共同验证。
+            cprint(
+                f"INFO {host} -> {service}（Host 路由器，跳过无业务 Host 的直连探测）",
+                "cyan",
+            )
+            continue
+        ok, detail = probe_local_backend(service, timeout=3, host_header=host)
+        http_code = backend_status_code(detail)
+        gateway_error = http_code is not None and 500 <= http_code <= 599
+        service_ok = ok and not gateway_error
+        cprint(
+            f"{'PASS' if service_ok else 'FAIL'} {host} -> {service}: {detail}",
+            "green" if service_ok else "red",
+        )
+        if not service_ok:
+            failures += 1
+
+        ch = custom_by_host.get(host)
+        if ch:
+            saas_status = ch.get("status") or "-"
+            ssl_status = (ch.get("ssl") or {}).get("status") or "-"
+            saas_ok = saas_status == "active"
+            ssl_ok = ssl_status == "active"
+            cprint(
+                f"  {'PASS' if saas_ok else 'FAIL'} SaaS={saas_status} ssl={ssl_status}",
+                "green" if saas_ok and ssl_ok else "yellow" if saas_ok else "red",
+            )
+            if not saas_ok:
+                failures += 1
+            elif not ssl_ok:
+                cprint("  WARN 证书仍在签发/部署中", "yellow")
+            try:
+                zone = resolve_zone(host)
+                if zone is None:
+                    cprint(
+                        "  INFO 域名不在本账号 zone 下，跳过 DNS 检查",
+                        "cyan",
+                    )
+                else:
+                    target = get_dns_record_content(zone[1], host, "CNAME")
+                    if target in (PREFERRED_ENTRY, FALLBACK_ORIGIN):
+                        cprint(f"  PASS DNS CNAME -> {target}", "green")
+                    else:
+                        cprint(f"  FAIL DNS CNAME -> {target or '(空)'}", "red")
+                        failures += 1
+            except Exception as exc:
+                cprint(f"  FAIL DNS 检查: {exc}", "red")
+                failures += 1
+        elif not custom_error:
+            cprint("  INFO 未登记为 SaaS custom hostname（按普通 Tunnel 规则）", "cyan")
+
+        if include_https:
+            https_ok, detail = verify_https(host, timeout=10)
+            first_line = next(
+                (line.strip() for line in detail.splitlines() if line.startswith("HTTP/")),
+                "无 HTTP 状态",
+            )
+            cprint(
+                f"  {'PASS' if https_ok else 'FAIL'} 公网 HTTPS: {first_line}",
+                "green" if https_ok else "red",
+            )
+            if not https_ok:
+                failures += 1
+
+    cprint(
+        f"\n健康检查结果: {'PASS' if failures == 0 else f'FAIL ({failures} 项)'}",
+        "green" if failures == 0 else "red",
+    )
+    return failures == 0
+
+
+
+def switch_to_preferred(hostname: str) -> None:
+    zone = resolve_zone(hostname)
+    zone_id = zone[1] if zone else None
+    if zone_id is None:
+        cprint(
+            f"{hostname} 不在本账号 zone 下：脚本改不了解析，"
+            f"请手动把 CNAME 指到 {PREFERRED_ENTRY}",
+            "yellow",
+        )
+    ch = get_custom_hostname(hostname)
+    if not ch:
+        raise CFError("该域名还没有 SaaS 自定义主机名，请先走“新增并加速”")
+    if ch.get("status") != "active":
+        cprint("自定义主机名尚未 Active，先补验证并等待...", "yellow")
+        ch = refresh_custom_hostname(ch["id"])
+        apply_saas_validation_records(hostname, ch, zone_id)
+        if zone_id:
+            upsert_dns(zone_id, "CNAME", hostname, FALLBACK_ORIGIN, proxied=False, ttl=60)
+        ch = wait_custom_hostname_active(ch["id"], zone_id=zone_id, hostname=hostname)
+    if zone_id is None:
+        ok, detail = verify_https(hostname)
+        cprint(detail)
+        cprint(
+            f"请确认 DNS: CNAME {hostname} -> {PREFERRED_ENTRY}（结果: {'通' if ok else '未通'}）",
+            "green" if ok else "yellow",
+        )
+        return
+    upsert_dns(
+        zone_id,
+        "CNAME",
+        hostname,
+        PREFERRED_ENTRY,
+        proxied=False,
+        ttl=120,
+        comment="preferred CF entry via dual-domain saas",
+    )
+    api_cname = wait_dns_cname(zone_id, hostname, PREFERRED_ENTRY, timeout=90)
+    cprint(f"{hostname} 已切换到 {PREFERRED_ENTRY} (API确认: {api_cname})", "green")
+
+def check_token() -> None:
+    if not CF_API_TOKEN:
+        raise CFError(
+            "还没设置 Cloudflare API Token，任选一种方式:\n"
+            f"  1) 写文件（推荐，自动 600 权限）: (umask 077; echo '<token>' > {TOKEN_FILE})\n"
+            "  2) 环境变量: export CF_API_TOKEN=<token>\n"
+            "Token 权限需要: Zone:Read（读域名清单）、DNS:Edit（加解析）、"
+            "SSL and Certificates:Edit（SaaS 自定义主机名）"
+        )
+    resp = api("GET", "/user/tokens/verify")
+    if not resp.get("success"):
+        raise CFError(
+            f"API Token 无效: {resp.get('errors')}\n"
+            "确认 Token 未过期，且含 Zone:Read / DNS:Edit / SSL and Certificates:Edit 权限"
+        )
+    cprint("API Token 验证通过", "green")
+    first_run = not _zone_info
+    refresh_zone_cache()
+    if first_run and _zone_info:
+        names = sorted(_zone_info)
+        head = ", ".join(names[:8])
+        more = f" 等 {len(names)} 个" if len(names) > 8 else ""
+        cprint(f"账号里可用域名: {head}{more}", "cyan")
+        cprint("看完整清单（各域名已用主机名/是否可用）: cf-tunnel-accel domains", "cyan")
+
+
+def interactive_add() -> None:
+    hostname = choose_hostname_interactive()
+    if not hostname:
+        cprint("已取消", "yellow")
+        return
+    cprint("输入本地服务，例如: 127.0.0.1:8080 或 192.168.8.1:80 或 8080", "cyan")
+    service = normalize_service(prompt("本地服务 ip:port", "127.0.0.1:8080"))
+    cprint("\n即将配置:", "bold")
+    cprint(f"  域名   = {hostname}")
+    cprint(f"  后端   = {service}")
+    cprint(f"  回退源 = {FALLBACK_ORIGIN}")
+    cprint(f"  优选   = {PREFERRED_ENTRY} -> {get_current_preferred_target(strict=True)}")
+    if resolve_zone(hostname) is None:
+        cprint("  注意   = 该域名不在本账号，解析需要自己手动加", "yellow")
+    if not prompt_yes_no("确认执行？", True):
+        cprint("已取消", "yellow")
+        return
+    add_accelerated_service(hostname, service)
+
+def interactive_remove() -> None:
+    hostname = normalize_hostname(prompt("要删除的域名"))
+    if not prompt_yes_no(f"确认删除 {hostname} 的隧道/SaaS/DNS？", False):
+        cprint("已取消", "yellow")
+        return
+    remove_service(hostname)
+
+
+def interactive_switch() -> None:
+    hostname = normalize_hostname(prompt("要切换到优选的域名"))
+    switch_to_preferred(hostname)
+
+
+def install_cdn_schedule(interval_hours: int = 6) -> None:
+    """安装可选的 systemd 定时优选任务。"""
+    if not (1 <= interval_hours <= 168):
+        raise CFError("定时优选间隔必须是 1 到 168 小时")
+    script = str(Path(__file__).resolve())
+    service_text = f"""[Unit]
+Description=Probe and optimize Cloudflare Tunnel CDN entry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=10min
+ExecStart={script} cdn best
+WorkingDirectory=/root
+StandardOutput=journal
+StandardError=journal
+"""
+    timer_text = f"""[Unit]
+Description=Periodic Cloudflare Tunnel CDN optimization
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec={interval_hours}h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=cf-tunnel-accel-cdn.service
+
+[Install]
+WantedBy=timers.target
+"""
+    for path, content in (
+        (AUTO_CDN_SERVICE_UNIT, service_text),
+        (AUTO_CDN_TIMER_UNIT, timer_text),
+    ):
+        if path.exists():
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            shutil.copy2(path, path.with_suffix(path.suffix + f".bak.{ts}"))
+        atomic_write_text(path, content)
+        os.chmod(path, 0o644)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "--now", AUTO_CDN_TIMER_UNIT.name])
+    cprint(
+        f"已安装 CDN 自动优选：每 {interval_hours} 小时执行一次（防抖阈值 "
+        f"{CDN_SWITCH_MIN_IMPROVEMENT_PERCENT:.0f}%）。",
+        "green",
+    )
+
+
+def remove_cdn_schedule() -> None:
+    run(
+        ["systemctl", "disable", "--now", AUTO_CDN_TIMER_UNIT.name],
+        check=False,
+    )
+    for path in (AUTO_CDN_TIMER_UNIT, AUTO_CDN_SERVICE_UNIT):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    run(["systemctl", "daemon-reload"])
+    cprint("已移除 CDN 自动优选定时任务。", "green")
+
+
+def show_cdn_schedule() -> None:
+    enabled = run(
+        ["systemctl", "is-enabled", AUTO_CDN_TIMER_UNIT.name],
+        check=False,
+        timeout=10,
+    )
+    active = run(
+        ["systemctl", "is-active", AUTO_CDN_TIMER_UNIT.name],
+        check=False,
+        timeout=10,
+    )
+    cprint(f"CDN timer enabled: {(enabled.stdout or enabled.stderr).strip() or 'unknown'}")
+    cprint(f"CDN timer active:  {(active.stdout or active.stderr).strip() or 'unknown'}")
+    listing = run(
+        ["systemctl", "list-timers", AUTO_CDN_TIMER_UNIT.name, "--no-pager"],
+        check=False,
+        timeout=10,
+    )
+    if listing.stdout.strip():
+        cprint(listing.stdout.rstrip())
+
+
+def menu() -> None:
+    current_cdn = get_current_preferred_target(strict=True)
+    cprint(
+        f"""
+╔════════════════════════════════════════════╗
+║   Cloudflare Tunnel 一键优选加速脚本       ║
+╠════════════════════════════════════════════╣
+║ 隧道: {TUNNEL_NAME:10s}  配置: config-home.yml  ║
+║ 回退源: {FALLBACK_ORIGIN:28s} ║
+║ 优选入口: {PREFERRED_ENTRY:26s} ║
+║ 当前CDN: {current_cdn:27s} ║
+╚════════════════════════════════════════════╝
+""",
+        "bold",
+    )
+    while True:
+        current_cdn = get_current_preferred_target(strict=True)
+        cprint(f"当前优选 CDN: {PREFERRED_ENTRY} -> {current_cdn}", "cyan")
+        cprint("请选择操作:", "bold")
+        cprint("  1) 新增域名并自动加速（推荐）")
+        cprint("  2) 查看当前隧道 / SaaS / DNS")
+        cprint("  3) 将已有域名切换到优选入口")
+        cprint("  4) 删除业务域名（隧道+SaaS+DNS）")
+        cprint("  5) 仅重启隧道服务")
+        cprint("  6) 测速/一键换 CDN（推荐）")
+        cprint("  7) 全链路健康检查")
+        cprint("  8) CDN 自动优选定时任务")
+        cprint("  9) 查看账号可用域名（记不住域名时先看这里）")
+        cprint("  0) 退出")
+        choice = input("输入序号: ").strip()
+        try:
+            if choice == "1":
+                interactive_add()
+            elif choice == "2":
+                list_all()
+            elif choice == "3":
+                interactive_switch()
+            elif choice == "4":
+                interactive_remove()
+            elif choice == "5":
+                validate_and_restart_tunnel()
+            elif choice == "6":
+                interactive_cdn_menu()
+            elif choice == "7":
+                health_check()
+            elif choice == "8":
+                cprint("  1) 安装/更新定时任务（默认 6 小时）")
+                cprint("  2) 查看定时任务状态")
+                cprint("  3) 移除定时任务")
+                schedule_choice = input("输入序号: ").strip()
+                if schedule_choice == "1":
+                    raw_hours = prompt("间隔小时", "6")
+                    install_cdn_schedule(int(raw_hours))
+                elif schedule_choice == "2":
+                    show_cdn_schedule()
+                elif schedule_choice == "3":
+                    remove_cdn_schedule()
+                else:
+                    cprint("无效选项", "yellow")
+            elif choice == "9":
+                print_domains()
+            elif choice == "0":
+                cprint("再见。", "cyan")
+                return
+            else:
+                cprint("无效选项", "yellow")
+        except CFError as e:
+            cprint(f"错误: {e}", "red")
+        except KeyboardInterrupt:
+            cprint("\n已中断", "yellow")
+        except Exception as e:
+            cprint(f"未预期错误: {e}", "red")
+        print()
+
+
+def print_help() -> None:
+    print(
+        f"cf-tunnel-accel {SCRIPT_VERSION}\n"
+        "用法:\n"
+        "  cf-tunnel-accel                         # 交互菜单\n"
+        "  cf-tunnel-accel domains                   # 列出账号里可用的域名（推荐先看）\n"
+        "  cf-tunnel-accel domains --offline         # 只看本机缓存清单\n"
+        "  cf-tunnel-accel env                     # 当前生效配置（换服务器核对用）\n"
+        "  cf-tunnel-accel add                      # 从域名清单里交互选择\n"
+        "  cf-tunnel-accel add <zone>               # 只给 zone，再挑子域名\n"
+        "  cf-tunnel-accel add <域名> <ip:port>     # 完整写法（自动写 DNS）\n"
+        "  cf-tunnel-accel add <域名> <ip:port> --external  # 域名不在本账号，手动加解析\n"
+        "  cf-tunnel-accel list\n"
+        "  cf-tunnel-accel status                  # 简要状态与最近错误\n"
+        "  cf-tunnel-accel health [域名] [--https] # 全链路诊断\n"
+        "  cf-tunnel-accel switch <域名>\n"
+        "  cf-tunnel-accel del <域名>\n"
+        "  cf-tunnel-accel cdn show\n"
+        "  cf-tunnel-accel cdn test [额外cdn...]   # 只测速，不改 DNS\n"
+        "  cf-tunnel-accel cdn best [--force]      # 测速并按阈值自动切换\n"
+        "  cf-tunnel-accel cdn set <cdn域名>       # 直接切换\n"
+        "  cf-tunnel-accel schedule install [小时]\n"
+        "  cf-tunnel-accel schedule status|remove\n"
+        "\n环境变量:\n"
+        "  CF_TUNNEL_ACCEL_API_TOKEN / CF_API_TOKEN  覆盖 API Token\n"
+        f"  CF_TUNNEL_ACCEL_TOKEN_FILE                Token 文件（默认 {TOKEN_FILE}）\n"
+        "  CF_TUNNEL_ACCEL_CDN_MIN_IMPROVEMENT       自动切换最小改善百分比（默认 15）\n"
+        f"  CF_TUNNEL_ACCEL_ZONE_CACHE                域名清单缓存（默认 {ZONE_CACHE_PATH}）\n"
+        "  CF_TUNNEL_ACCEL_ZONE_CACHE_TTL            清单过期秒数（默认 21600，0=每次刷新）\n"
+    )
+
+
+def _main_locked(argv: List[str]) -> int:
+    first_cmd = argv[1].lower() if len(argv) >= 2 else ""
+    offline_env = first_cmd in ("env", "config", "show-config")
+    offline_ok = offline_env or first_cmd in (
+        "domains",
+        "zones",
+        "list-domains",
+    )
+    try:
+        check_token()
+    except Exception as exc:
+        if offline_env:
+            cprint(f"Token 检查失败（仍显示本机配置）: {exc}", "yellow")
+            return print_env()
+        if offline_ok:
+            # 没有 Token 也要能看“账号里有哪些域名”，退回本机缓存清单
+            cprint(f"Token 检查失败（改用本机缓存清单）: {exc}", "yellow")
+            return 0 if print_domains(offline=True) == 0 else 1
+        cprint(f"Token 检查失败: {exc}", "red")
+        return 1
+
+    if len(argv) >= 2:
+        cmd = argv[1].lower()
+        try:
+            if cmd in ("domains", "zones", "list-domains"):
+                return print_domains(show_dns="--no-dns" not in argv[2:])
+            if cmd in ("env", "config", "show-config"):
+                return print_env()
+            if cmd == "add":
+                add_args = [a for a in argv[2:]]
+                external = "--external" in add_args
+                add_args = [a for a in add_args if a != "--external"]
+                if len(add_args) > 2:
+                    raise CFError("add 用法: add [域名或zone] [ip:port] [--external]")
+                if not add_args:
+                    hostname = choose_hostname_interactive()
+                    if not hostname:
+                        cprint("已取消", "yellow")
+                        return 0
+                elif SERVICE_RE.match(add_args[0]):
+                    raise CFError("add 用法: add [域名或zone] [ip:port] [--external]")
+                elif len(add_args) == 1:
+                    raw = add_args[0]
+                    bare = raw.strip().lower().rstrip(".")
+                    try:
+                        ensure_zone_cache()
+                    except Exception:
+                        pass
+                    if bare in _zone_cache:
+                        picked = _pick_subdomain(bare)
+                        if not picked:
+                            cprint("已取消", "yellow")
+                            return 0
+                        hostname = picked
+                    elif HOST_RE.match(bare):
+                        hostname = normalize_hostname(raw)
+                        if resolve_zone(hostname) is None and not external:
+                            cprint(
+                                f"{hostname} 不在本账号 zone 列表里；自动写 DNS 需要本账号权限。",
+                                "yellow",
+                            )
+                            if not prompt_yes_no("按手动 DNS 模式继续？", False):
+                                print_domains(show_dns=False)
+                                return 1
+                            external = True
+                    else:
+                        picked = choose_hostname_interactive(raw)
+                        if not picked:
+                            cprint("已取消", "yellow")
+                            return 0
+                        hostname = picked
+                else:
+                    hostname = normalize_hostname(add_args[0])
+                if len(add_args) == 2:
+                    service = normalize_service(add_args[1])
+                else:
+                    cprint(
+                        "输入本地服务，例如: 127.0.0.1:8080 或 192.168.8.1:80 或 8080",
+                        "cyan",
+                    )
+                    service = normalize_service(prompt("本地服务 ip:port", "127.0.0.1:8080"))
+                add_accelerated_service(hostname, service, external=external)
+                return 0
+            if cmd == "list":
+                list_all()
+                return 0
+            if cmd in ("status", "show"):
+                show_status()
+                return 0
+            if cmd in ("health", "check", "doctor"):
+                health_args = [arg for arg in argv[2:] if arg not in ("--https", "-H")]
+                if len(health_args) > 1:
+                    raise CFError("health 最多接受一个域名")
+                health_host = health_args[0].lower().rstrip(".") if health_args else None
+                if health_host:
+                    # 健康检查也允许检查系统回退源，因此不使用业务域名保留字限制。
+                    if not HOST_RE.match(health_host):
+                        raise CFError(f"域名格式不正确: {health_host}")
+                return 0 if health_check(health_host, "--https" in argv or "-H" in argv) else 1
+            if cmd in ("del", "delete", "rm") and len(argv) >= 3:
+                remove_service(normalize_hostname(argv[2]))
+                return 0
+            if cmd == "switch" and len(argv) >= 3:
+                switch_to_preferred(normalize_hostname(argv[2]))
+                return 0
+            if cmd == "cdn":
+                sub = (argv[2].lower() if len(argv) >= 3 else "menu")
+                if sub in ("show", "status", "current"):
+                    cur = get_current_preferred_target(strict=True)
+                    cprint(f"{PREFERRED_ENTRY} -> {cur}", "green")
+                    return 0
+                if sub in ("test", "bench", "ping"):
+                    extras = argv[3:] if len(argv) > 3 else None
+                    if extras and any(x.startswith("-") for x in extras):
+                        raise CFError("cdn test 只接受 CDN 域名参数")
+                    test_and_maybe_switch_cdn(
+                        auto_apply_best=False,
+                        candidates=ensure_candidate_list(extras) if extras else None,
+                        interactive=False,
+                    )
+                    return 0
+                if sub in ("best", "auto", "optimize"):
+                    raw_args = argv[3:] if len(argv) > 3 else []
+                    force = "--force" in raw_args
+                    extras = [x for x in raw_args if x != "--force"]
+                    if any(x.startswith("-") for x in extras):
+                        raise CFError("未知参数；可用: cdn best [额外cdn...] [--force]")
+                    test_and_maybe_switch_cdn(
+                        auto_apply_best=True,
+                        candidates=ensure_candidate_list(extras) if extras else None,
+                        force=force,
+                    )
+                    return 0
+                if sub in ("set", "use", "switch") and len(argv) >= 4:
+                    set_preferred_target(argv[3])
+                    return 0
+                if sub == "menu":
+                    interactive_cdn_menu()
+                    return 0
+                raise CFError("cdn 子命令: show | test [更多域名...] | best [--force] | set <cdn域名>")
+            if cmd in ("schedule", "timer", "auto"):
+                sub = argv[2].lower() if len(argv) >= 3 else "status"
+                if sub in ("install", "enable", "on"):
+                    try:
+                        hours = int(argv[3]) if len(argv) >= 4 else 6
+                    except ValueError:
+                        raise CFError("定时任务间隔必须是整数小时") from None
+                    install_cdn_schedule(hours)
+                    return 0
+                if sub in ("remove", "disable", "off", "uninstall"):
+                    remove_cdn_schedule()
+                    return 0
+                if sub in ("status", "show"):
+                    show_cdn_schedule()
+                    return 0
+                raise CFError("schedule 子命令: install [小时] | status | remove")
+            cprint("参数不正确，进入交互菜单。可用 --help 查看。", "yellow")
+        except Exception as exc:
+            cprint(f"错误: {exc}", "red")
+            return 1
+
+    menu()
+    return 0
+
+
+def command_requires_lock(argv: List[str]) -> bool:
+    """只让会改共享资源的命令持有写锁。"""
+    if len(argv) < 2:
+        return True  # 交互菜单可能执行任意写操作
+    cmd = argv[1].lower()
+    if cmd in (
+        "list",
+        "domains",
+        "zones",
+        "list-domains",
+        "env",
+        "config",
+        "show-config",
+        "status",
+        "show",
+        "health",
+        "check",
+        "doctor",
+    ):
+        return False
+    if cmd == "cdn":
+        sub = argv[2].lower() if len(argv) >= 3 else "menu"
+        return sub not in ("show", "status", "current", "test", "bench", "ping")
+    if cmd in ("schedule", "timer", "auto"):
+        sub = argv[2].lower() if len(argv) >= 3 else "status"
+        return sub not in ("status", "show")
+    return True
+
+
+def main(argv: List[str]) -> int:
+    # 帮助/版本不应触发 API 请求、systemd 锁或网络依赖。
+    if len(argv) >= 2 and argv[1].lower() in ("-h", "--help", "help"):
+        print_help()
+        return 0
+    if len(argv) >= 2 and argv[1].lower() in ("-v", "--version", "version"):
+        print(f"cf-tunnel-accel {SCRIPT_VERSION}")
+        return 0
+    try:
+        if command_requires_lock(argv):
+            with exclusive_lock():
+                return _main_locked(argv)
+        # 只读诊断/测速不修改共享状态，不阻塞正在进行的诊断或人工查看。
+        return _main_locked(argv)
+    except KeyboardInterrupt:
+        cprint("\n已中断", "yellow")
+        return 130
+    except Exception as exc:
+        cprint(f"错误: {exc}", "red")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
