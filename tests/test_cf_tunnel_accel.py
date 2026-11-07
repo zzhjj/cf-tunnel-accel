@@ -207,5 +207,179 @@ class MissingConfigTests(unittest.TestCase):
     def test_upsert_tunnel_hostname_raises_cf_error(self):
         with self.assertRaises(mod.CFError):
             mod.upsert_tunnel_hostname("x.example.com", "http://127.0.0.1:1")
+
+
+class SlowRestartTests(unittest.TestCase):
+    """慢重启不能误判成“新配置未生效”而触发回滚（现场事故复现）。"""
+
+    def test_run_timeout_raises_command_timeout(self):
+        with self.assertRaises(mod.CommandTimeout):
+            mod.run(["sleep", "5"], check=False, timeout=0.05)
+        # 仍然是 CFError，老调用点的 except CFError 不受影响
+        self.assertTrue(issubclass(mod.CommandTimeout, mod.CFError))
+
+    def test_restart_command_timeout_is_not_fatal(self):
+        calls = []
+
+        def fake_run(cmd, check=True, timeout=None):
+            calls.append((cmd, check, timeout))
+            if cmd[:2] == ["systemctl", "restart"]:
+                raise mod.CommandTimeout("命令超时（180s）: systemctl restart x")
+            raise AssertionError(f"unexpected: {cmd}")
+
+        original = mod.run
+        try:
+            mod.run = fake_run
+            mod._restart_service()  # 不应抛异常
+        finally:
+            mod.run = original
+        self.assertTrue(any(c[0][:2] == ["systemctl", "restart"] for c in calls))
+        # 命令超时要给足余量，不能再用 60s 默认值
+        restart_timeout = [c[2] for c in calls if c[0][:2] == ["systemctl", "restart"]][0]
+        self.assertGreaterEqual(restart_timeout, 90)
+
+    def test_restart_nonzero_exit_is_not_the_verdict(self):
+        # stop 被 SIGKILL 时 systemctl 返回 1，但服务已经拉起；这里只提示不抛错，
+        # 成败由 active 轮询 + MainPID 校验判定。
+        def fake_run(cmd, check=True, timeout=None):
+            return mock.Mock(returncode=1, stdout="", stderr="Job failed")
+
+        original = mod.run
+        try:
+            mod.run = fake_run
+            mod._restart_service()  # 不应抛异常
+        finally:
+            mod.run = original
+
+    def test_wait_tolerates_transient_failed_state(self):
+        """failed 只是 Restart=on-failure 的中间态，不能立刻判死。"""
+        states = iter(["activating", "failed", "activating", "active"])
+        original_run = mod.run
+        original_grace = mod.SERVICE_FAILED_GRACE
+
+        def fake_run(cmd, check=True, timeout=None):
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return mock.Mock(returncode=3, stdout=next(states) + "\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        try:
+            mod.run = fake_run
+            mod.SERVICE_FAILED_GRACE = 25
+            mod._wait_service_active(timeout=10)  # 不应抛异常
+        finally:
+            mod.run = original_run
+            mod.SERVICE_FAILED_GRACE = original_grace
+
+    def test_wait_gives_up_after_failed_grace(self):
+        original_run = mod.run
+        original_grace = mod.SERVICE_FAILED_GRACE
+
+        def fake_run(cmd, check=True, timeout=None):
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return mock.Mock(returncode=3, stdout="failed\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        try:
+            mod.run = fake_run
+            mod.SERVICE_FAILED_GRACE = 1
+            with self.assertRaises(mod.CFError):
+                mod._wait_service_active(timeout=10)
+        finally:
+            mod.run = original_run
+            mod.SERVICE_FAILED_GRACE = original_grace
+
+    def test_restart_that_keeps_old_pid_is_fatal(self):
+        """配置写盘了但进程没换 —— 这才是真失败，必须回滚。"""
+
+        def fake_run(cmd, check=True, timeout=None):
+            if cmd[:2] == ["systemctl", "show"]:
+                return mock.Mock(returncode=0, stdout="4242\n", stderr="")
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return mock.Mock(returncode=0, stdout="active\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        original_run = mod.run
+        try:
+            mod.run = fake_run
+            with self.assertRaises(mod.CFError):
+                mod._validate_and_restart_once()
+        finally:
+            mod.run = original_run
+
+    def test_validate_and_restart_survives_slow_stop(self):
+        """校验通过 + 重启命令超时 + 随后 active ⇒ 视为成功，不回滚。"""
+        original_run = mod.run
+        original_bin = mod.CLOUDFLARED_BIN
+
+        pids = iter([111, 222])  # 重启前 / 重启后：进程确实换了
+
+        def fake_run(cmd, check=True, timeout=None):
+            if cmd[:2] == ["systemctl", "restart"]:
+                raise mod.CommandTimeout("命令超时（180s）: systemctl restart x")
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return mock.Mock(returncode=0, stdout="active\n", stderr="")
+            if cmd[:2] == ["systemctl", "show"]:
+                return mock.Mock(returncode=0, stdout=f"{next(pids)}\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        try:
+            mod.run = fake_run
+            mod._validate_and_restart_once()  # 不抛异常即通过
+        finally:
+            mod.run = original_run
+            mod.CLOUDFLARED_BIN = original_bin
+
+
+class StaleSeedZoneTests(unittest.TestCase):
+    """脚本内置的过期 zone ID 不能污染解析结果（现场 23 条假 FAIL）。"""
+
+    def setUp(self):
+        self._cache = dict(mod._zone_cache)
+        self._info = {k: dict(v) for k, v in mod._zone_info.items()}
+        self._from_disk = set(mod._zone_cache_from_disk)
+        self._path = mod.ZONE_CACHE_PATH
+        self._api = mod.api
+
+    def tearDown(self):
+        mod._zone_cache.clear()
+        mod._zone_cache.update(self._cache)
+        mod._zone_info.clear()
+        mod._zone_info.update(self._info)
+        mod._zone_cache_from_disk.clear()
+        mod._zone_cache_from_disk.update(self._from_disk)
+        mod.ZONE_CACHE_PATH = self._path
+        mod.api = self._api
+
+    def test_refresh_drops_zones_the_account_cannot_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            mod.ZONE_CACHE_PATH = Path(td) / "zones.json"
+            mod._zone_cache.clear()
+            mod._zone_info.clear()
+            mod._zone_cache_from_disk.clear()
+            # 模拟：内置种子 + 磁盘缓存里都有账号里已不存在的 dead.example
+            mod._zone_cache.update({"live.example": "z1", "dead.example": "z9"})
+            mod._zone_cache_from_disk.update({"dead.example"})
+            mod._zone_info["dead.example"] = {
+                "name": "dead.example", "id": "z9", "status": "active",
+                "type": "full", "plan": "Free", "paused": False, "cached": True,
+            }
+
+            def fake_api(method, path, body=None, timeout=45):
+                self.assertEqual(path.split("?")[0], "/zones")
+                return {
+                    "success": True,
+                    "result": [{"id": "z1", "name": "live.example", "status": "active",
+                                "type": "full", "paused": False,
+                                "plan": {"name": "Free"}, "account": {"name": "acct"}}],
+                    "result_info": {"total_pages": 1},
+                }
+
+            mod.api = fake_api
+            mod.refresh_zone_cache()
+            self.assertEqual(mod._zone_cache, {"live.example": "z1"})
+            self.assertNotIn("dead.example", mod._zone_info)
+            self.assertIsNone(mod.zone_of_host("a.dead.example"))
+            # 解析失败要退到 INFO（None），而不是拿死 ID 去发 DNS 请求
+            self.assertIsNone(mod.resolve_zone("a.dead.example"))
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -356,6 +356,9 @@ credentials-file: $cred
 
 protocol: http2
 
+# SIGTERM 后最多优雅等 5s 就退出（默认 30s，且可能卡住不退导致 stop 卡到超时）
+grace-period: 5s
+
 ingress:
   # install.sh 生成的最小配置：$SERVICE_HOSTNAME -> $SERVICE_BACKEND
   - hostname: $SERVICE_HOSTNAME
@@ -403,6 +406,9 @@ Wants=network-online.target
 
 [Service]
 TimeoutStartSec=15
+# cloudflared 退出流程可能挂住，stop 必须自己设上界；否则 systemctl restart
+# 会一直等到默认 90s 再 SIGKILL，脚本侧就会被判成“重启超时”。
+TimeoutStopSec=20
 Type=notify
 ExecStart=${CLOUDFLARED_BIN} --no-autoupdate --config ${TUNNEL_CONFIG} tunnel run
 Restart=on-failure

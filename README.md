@@ -188,3 +188,8 @@ CF_TUNNEL_ACCEL_SCRIPT=/path/to/script python3 tests/test_cf_tunnel_accel.py
   2. 配置放在别处：`export CF_TUNNEL_ACCEL_CONFIG=/实际/路径.yml`（写进 `~/.config/cf-tunnel-accel/env` 可永久生效）；
   3. 只想看云端信息：`list`/`status`/`health` 会跳过本地隧道部分，SaaS 与 DNS 依旧会显示。
   `add` 在配置缺失时会**直接失败且不改动云端**，属于预期行为。
+- `新 Tunnel 配置未能生效，已自动回滚: 命令超时（60s）: systemctl restart ...` → cloudflared 收到 SIGTERM 后可能卡在退出流程不返回，systemd 要等 `TimeoutStopSec`（默认 90s）到点才 SIGKILL，`systemctl restart` 因此可能超过 60s，旧版脚本把它误判成失败并回滚。修复三件套：
+  1. 隧道配置里加 `grace-period: 5s`（脚本日常写入时会自动补齐，`health` 缺这项会 WARN）；
+  2. systemd 单元里加 `TimeoutStopSec=20`（`install.sh` 生成的模板已包含，老机器手动补一行 + `systemctl daemon-reload`）；
+  3. 1.3.1 起脚本把「重启命令超时 / 非 0 退出」只当提示，成败由随后的 `is-active` 轮询 + `MainPID` 是否变化判定，只有进程没换才回滚。
+- `health` 里一批域名全是 `FAIL DNS 检查: 读取 DNS 失败: [10000] Authentication error` → 那些域名所属 zone 已不在本账号（典型：zone 迁到别的账号，本地只剩 SaaS 自定义主机名）。1.3.1 起刷新 zone 清单会清掉账号里读不到的 zone，这类域名退化成 `INFO 域名不在本账号 zone 下，跳过 DNS 检查`，不再计入 FAIL。

@@ -75,7 +75,7 @@ load_env_file()
 # =========================
 # 可改配置
 # =========================
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.3.1"
 
 # Token 优先级：环境变量 > root-only token 文件。将 Token 留在文件中可避免
 # 脚本同步/备份时泄露。可用 CF_TUNNEL_ACCEL_TOKEN_FILE 覆盖默认位置。
@@ -176,6 +176,14 @@ API_RETRY_MAX_WAIT = env_float("CF_TUNNEL_ACCEL_API_RETRY_MAX_WAIT", 8.0, minimu
 CDN_SWITCH_MIN_IMPROVEMENT_PERCENT = env_float(
     "CF_TUNNEL_ACCEL_CDN_MIN_IMPROVEMENT", 15.0, minimum=0.0
 )
+SERVICE_RESTART_TIMEOUT = env_int("CF_TUNNEL_ACCEL_RESTART_TIMEOUT", 180, minimum=30)
+SERVICE_ACTIVE_WAIT = env_int("CF_TUNNEL_ACCEL_ACTIVE_WAIT", 120, minimum=10)
+# unit 里 Restart=on-failure 会自动重试，failed 往往只是中间态；连续失败多久
+# 才认定“真起不来”（要大于 TimeoutStartSec + RestartSec）。
+SERVICE_FAILED_GRACE = env_int("CF_TUNNEL_ACCEL_FAILED_GRACE", 25, minimum=5)
+# cloudflared 收到 SIGTERM 后可能卡在退出流程，systemd 只能等 TimeoutStopSec
+# 到点 SIGKILL；重启耗时因此可能接近 1 分钟。重启命令超时不等于失败，
+# 真正的判据是随后的 is-active 轮询（见 _restart_service）。
 
 def env_known_zones(default: Dict[str, str]) -> Dict[str, str]:
     """CF_TUNNEL_ACCEL_KNOWN_ZONES="a.com:<zone_id>,b.com:<zone_id>" 可追加/覆盖离线表。"""
@@ -190,7 +198,6 @@ def env_known_zones(default: Dict[str, str]) -> Dict[str, str]:
 # 已知 zone 缓存（可自动补充）
 KNOWN_ZONES = env_known_zones(
     {
-        "zzhnb.cf": "cf1bb8d457217936bcca41555c08144d",
         "261119.xyz": "16afabbf2ed8e22e6ba6ea30517fd126",
         "v50kkp.eu.org": "beaf16d441346d4b739cdb0a6b03ca9c",
     }
@@ -219,6 +226,10 @@ SERVICE_RE = re.compile(
 
 class CFError(RuntimeError):
     pass
+
+
+class CommandTimeout(CFError):
+    """命令超时：只说明没等到返回，不代表命令失败。"""
 
 
 def cprint(msg: str = "", color: Optional[str] = None) -> None:
@@ -362,7 +373,7 @@ def run(
     except FileNotFoundError:
         raise CFError(f"未找到命令: {cmd[0]}") from None
     except subprocess.TimeoutExpired:
-        raise CFError(f"命令超时（{timeout}s）: {' '.join(cmd)}") from None
+        raise CommandTimeout(f"命令超时（{timeout}s）: {' '.join(cmd)}") from None
     if check and p.returncode != 0:
         raise CFError(
             f"命令失败: {' '.join(cmd)}\nstdout: {p.stdout}\nstderr: {p.stderr}"
@@ -514,8 +525,9 @@ def refresh_zone_cache() -> None:
             "account": (z.get("account") or {}).get("name") or "",
             "cached": False,
         }
-    # 账号里已经删掉的域名别留在缓存里误导选择
-    for stale in sorted(_zone_cache_from_disk - live):
+    # 刷新是权威来源：账号里读不到的 zone（含脚本内置的过期 ID）一律清掉，
+    # 否则 resolve_zone 会把业务域名指向一个不存在的 zone，DNS 操作全变 10000。
+    for stale in sorted(set(_zone_cache) - live):
         _zone_cache.pop(stale, None)
         _zone_info.pop(stale, None)
     _zone_cache_from_disk.clear()
@@ -565,9 +577,14 @@ def resolve_zone(hostname: str) -> Optional[Tuple[str, str]]:
     for i in range(len(labels) - 1):
         candidate = ".".join(labels[i:])
         resp = api("GET", f"/zones?name={urllib.parse.quote(candidate)}")
-        if resp.get("success") and resp.get("result"):
-            z = resp["result"][0]
-            name = str(z.get("name") or candidate).strip().lower()
+        if not resp.get("success"):
+            continue
+        for z in resp.get("result") or []:
+            # 只认名字完全对得上的结果：API 即使在 name= 过滤下也可能回别的 zone，
+            # 盲取 result[0] 会让业务域名挂到一个不相关的 zone 上。
+            name = str(z.get("name") or "").strip().lower()
+            if name != candidate:
+                continue
             _zone_cache[name] = z["id"]
             plan = z.get("plan") or {}
             _zone_info[name] = {
@@ -1450,6 +1467,29 @@ def _ensure_fallback_ingress(lines: List[str]) -> bool:
     return True
 
 
+def _ensure_grace_period(lines: List[str]) -> bool:
+    """确保顶层写了 grace-period，返回是否改动了 lines。
+
+    cloudflared 默认只给 30s 优雅期，本机实测还会卡在退出流程根本不返回，
+    systemd 只能等 TimeoutStopSec 到点 SIGKILL；给个 5s 上界后 stop 几秒内
+    就能干净结束，脚本的 restart 也就不会再超时误判成“配置未生效”。
+    """
+    for line in lines:
+        if re.match(r"^grace-period:\s*\S+", line):
+            return False
+    block = [
+        "# SIGTERM 后最多优雅等待 5s 就退出（默认 30s，且可能卡住不退出）",
+        "grace-period: 5s",
+        "",
+    ]
+    for idx, line in enumerate(lines):
+        if line.startswith("ingress:"):
+            lines[idx:idx] = block
+            return True
+    lines.extend([""] + block)
+    return True
+
+
 def upsert_tunnel_hostname(hostname: str, service_url: str) -> bool:
     """新增/更新 ingress；返回是否真的修改了配置。"""
     if not CONFIG_PATH.exists():
@@ -1508,6 +1548,10 @@ def upsert_tunnel_hostname(hostname: str, service_url: str) -> bool:
         changed = True
         cprint(f"已自动补回退源: {FALLBACK_ORIGIN}", "yellow")
 
+    if _ensure_grace_period(lines):
+        changed = True
+        cprint("已补 grace-period: 5s（避免重启时 cloudflared 卡住不退出）", "yellow")
+
     if not changed:
         cprint(f"隧道主机名已存在且无需更新: {hostname} -> {service_url}", "green")
         return False
@@ -1547,25 +1591,87 @@ def remove_tunnel_hostname(hostname: str) -> bool:
     return removed
 
 
-def _wait_service_active(timeout: int = 15) -> None:
+def _wait_service_active(timeout: int = SERVICE_ACTIVE_WAIT) -> None:
+    """等待服务回到 active；重启期间会先 deactivating 再 activating。"""
     deadline = time.time() + timeout
+    failed_since: Optional[float] = None
     last = ""
     while time.time() < deadline:
         p = run(["systemctl", "is-active", SERVICE_NAME], check=False, timeout=10)
-        last = (p.stdout or "").strip()
+        last = (p.stdout or "").strip() or (p.stderr or "").strip()
         if last == "active":
             return
+        if last == "failed":
+            # Restart=on-failure 会自己把服务拉起来，failed 经常只是中间态
+            #（现场见过连续两次启动超时后第三次成功），别在这里过早判死。
+            failed_since = failed_since or time.time()
+            if time.time() - failed_since >= SERVICE_FAILED_GRACE:
+                break
+        else:
+            failed_since = None
         time.sleep(1)
     raise CFError(f"隧道服务未 active: {last or '(无状态)'}")
+
+
+def _restart_service() -> None:
+    """重启隧道服务，超时只当“结果未知”，由调用方的 active 轮询定成败。
+
+    cloudflared 收到 SIGTERM 后经常迟迟不退出（实测要等 systemd 的
+    TimeoutStopSec 走到 SIGKILL 才停），stop+start 因此可能接近一分钟。
+    以前这里用默认 60s 超时并直接抛错，一次慢重启就会被当成“新配置未生效”
+    并触发回滚——回滚本身又要再重启一次，于是雪崩。
+    """
+    try:
+        p = run(
+            ["systemctl", "restart", SERVICE_NAME],
+            check=False,
+            timeout=SERVICE_RESTART_TIMEOUT,
+        )
+    except CommandTimeout as exc:
+        cprint(f"{exc}；重启仍在进行，继续等状态...", "yellow")
+        return
+    if p.returncode != 0:
+        # stop 阶段被 SIGKILL 时 systemctl 会以非 0 退出，但服务往往已经拉起。
+        # 成败一律交给后面的 active 轮询 + MainPID 校验判定。
+        detail = (p.stderr or p.stdout or "").strip().splitlines()
+        cprint(
+            f"systemctl restart 返回 {p.returncode}"
+            f"（{detail[-1] if detail else '无输出'}），继续核对服务状态...",
+            "yellow",
+        )
+
+
+def _service_main_pid() -> int:
+    """当前 unit 的 MainPID（0 表示没有在跑的进程）。"""
+    p = run(
+        ["systemctl", "show", SERVICE_NAME, "-p", "MainPID", "--value"],
+        check=False,
+        timeout=10,
+    )
+    try:
+        return int((p.stdout or "0").strip() or 0)
+    except ValueError:
+        return 0
 
 
 def _validate_and_restart_once() -> None:
     cprint("校验隧道配置...", "blue")
     run([CLOUDFLARED_BIN, "--config", str(CONFIG_PATH), "tunnel", "ingress", "validate"])
-    cprint("重启隧道服务...", "blue")
-    run(["systemctl", "restart", SERVICE_NAME])
+    cprint(
+        "重启隧道服务...（cloudflared 退出慢时由 systemd 兜底终止，"
+        f"最多约 {SERVICE_RESTART_TIMEOUT}s）",
+        "blue",
+    )
+    pid_before = _service_main_pid()
+    _restart_service()
     _wait_service_active()
-    cprint(f"隧道服务已运行: {SERVICE_NAME}", "green")
+    pid_after = _service_main_pid()
+    if pid_before and pid_after and pid_before == pid_after:
+        # 配置已经写盘但进程没换，新 ingress 不会生效；这种情况才该回滚。
+        raise CFError(
+            f"隧道服务未真正重启（MainPID 仍是 {pid_after}），新配置可能未生效"
+        )
+    cprint(f"隧道服务已运行: {SERVICE_NAME}（MainPID {pid_after or '?'}）", "green")
 
 
 def validate_and_restart_tunnel(rollback_text: Optional[str] = None) -> None:
@@ -2619,6 +2725,15 @@ def health_check(hostname: Optional[str] = None, include_https: bool = False) ->
     )
     if not valid:
         failures += 1
+
+    # 重启慢/“新配置未生效”的根因常常就在这里：没有 grace-period 时
+    # cloudflared 收到 SIGTERM 可能一直不退出，只能等 systemd 的
+    # TimeoutStopSec 到点 SIGKILL，restart 因此拖到一分钟以上。
+    if not re.search(r"(?m)^grace-period:\s*\S+", text):
+        cprint(
+            "WARN 配置缺少 grace-period：重启可能卡在 stop 阶段（建议 grace-period: 5s）",
+            "yellow",
+        )
 
     # 只有全量检查时才校验公共辅助链路；单域名检查保持快速。
     if hostname is None:
