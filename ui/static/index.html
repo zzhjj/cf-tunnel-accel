@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh-CN" data-app="arc">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<title>ARC — cf-tunnel-accel console</title>
+<link rel="icon" href="/mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ░░░ grain / vignette ░░░ -->
+<div class="grain" aria-hidden="true"></div>
+<div class="vignette" aria-hidden="true"></div>
+<div class="cursor" id="cursor" aria-hidden="true"><span class="cursor-dot"></span><span class="cursor-ring"></span></div>
+
+<!-- ░░░ GATE ░░░ -->
+<section class="gate" id="gate" aria-label="访问验证">
+  <div class="gate-grid" aria-hidden="true"></div>
+  <div class="gate-inner">
+    <div class="gate-head">
+      <svg class="mark" viewBox="0 0 440 214" role="img" aria-label="ARC">
+        <path class="mark-a" d="M10 200 L62 14 L114 200 M33 132 H91" />
+        <path class="mark-r" d="M150 200 V14 H196 A42 42 0 0 1 196 98 H150 M196 98 L252 200" />
+        <path class="mark-c" d="M398 32 A95 95 0 1 0 398 182" />
+      </svg>
+      <p class="gate-kicker">CF-TUNNEL-ACCEL · ACCELERATION ROUTE CONSOLE</p>
+    </div>
+
+    <div class="gate-form">
+      <label class="field" for="token">
+        <span class="field-label">访问凭据 / ACCESS TOKEN</span>
+        <input id="token" name="token" type="password" inputmode="latin" autocomplete="off"
+               spellcheck="false" placeholder="48 位十六进制凭据" aria-describedby="gate-hint">
+        <span class="field-caret" aria-hidden="true"></span>
+      </label>
+      <button class="btn btn-solid" id="gate-submit" type="button">
+        <span>进入控制台</span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6"/></svg>
+      </button>
+      <p class="gate-msg" id="gate-msg" role="alert" aria-live="polite"></p>
+      <p class="gate-hint" id="gate-hint">
+        凭据保存在服务端 <code>~/.config/cf-tunnel-accel/ui-token</code>（0600）；
+        页面永不回显，输入错误会按 IP 递增锁定。
+      </p>
+    </div>
+
+    <div class="gate-meta" aria-hidden="true">
+      <span>LOCAL <b>ARC</b> 1.3.1</span>
+      <span>BIND · 凭据门</span>
+    </div>
+
+    <ul class="gate-security" aria-label="安全措施">
+      <li><b>01</b><span>默认仅监听回环地址，对外暴露需显式 <code>--host</code></span></li>
+      <li><b>02</b><span>会话存于 HttpOnly Cookie，脚本读不到</span></li>
+      <li><b>03</b><span>写操作校验 CSRF / Origin / Sec-Fetch-Site</span></li>
+      <li><b>04</b><span>失败退避锁定 + 全量审计落盘</span></li>
+      <li><b>05</b><span>CSP 同源白名单，禁内联脚本与框架嵌套</span></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ░░░ APP ░░░ -->
+<main class="app" id="app" hidden>
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="回到顶部">
+      <svg viewBox="0 0 128 62" class="brand-mark" aria-hidden="true">
+        <path d="M3 58 L13 5 L23 58 M7 38 H19"/>
+        <path d="M38 58 V5 H49 A11 11 0 0 1 49 27 H38 M49 27 L60 58"/>
+        <path d="M112 12 A21 21 0 1 0 112 50"/>
+      </svg>
+      <span class="brand-text">ARC<em>console</em></span>
+    </a>
+
+    <div class="ticker" id="ticker" aria-live="off">
+      <div class="ticker-track" id="ticker-track"></div>
+    </div>
+
+    <div class="topbar-actions">
+      <button class="ghost-btn" id="cmd-open" type="button">
+        <span>命令</span><kbd>⌘K</kbd>
+      </button>
+      <button class="ghost-btn danger-hover" id="logout" type="button" title="退出会话">⏻</button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="rail" aria-label="章节导航">
+      <a href="#services" data-rail="services"><i>01</i><span>listeners</span></a>
+      <a href="#routes" data-rail="routes"><i>02</i><span>routes</span></a>
+      <a href="#diagnostics" data-rail="diagnostics"><i>03</i><span>diagnostics</span></a>
+      <a href="#journal" data-rail="journal"><i>04</i><span>journal</span></a>
+      <div class="rail-progress"><span id="rail-bar"></span></div>
+    </nav>
+
+    <div class="content" id="top">
+
+      <!-- HERO -->
+      <section class="hero" id="hero">
+        <div class="hero-copy">
+          <p class="eyebrow reveal">ACCELERATION ROUTE CONSOLE <span class="dot" aria-hidden="true"></span> <span id="hero-version">v—</span></p>
+          <h1 class="hero-title">
+            <span class="line reveal"><span>SIGNAL</span></span>
+            <span class="line reveal"><span>OVER</span></span>
+            <span class="line reveal"><span class="hero-title-accent">TUNNEL</span></span>
+          </h1>
+          <p class="hero-lede reveal">
+            一条隧道，把所有本地服务接到同一个入口。
+            这里是它的仪表盘：谁在监听、谁被路由、谁在报错。
+          </p>
+          <div class="hero-cta reveal">
+            <button class="btn btn-solid" id="hero-add" type="button">
+              <span>新增域名</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <button class="btn btn-wire" id="hero-health" type="button">
+              <span>全链路体检</span>
+            </button>
+          </div>
+        </div>
+
+        <figure class="hero-canvas">
+          <canvas id="topology" aria-label="加速链路拓扑图"></canvas>
+          <figcaption class="canvas-legend">
+            <span><i class="lg lg-entry"></i>入口</span>
+            <span><i class="lg lg-saas"></i>SaaS</span>
+            <span><i class="lg lg-node"></i>后端</span>
+            <span class="legend-hint">拖动节点 · 点击域名定位</span>
+          </figcaption>
+        </figure>
+
+        <dl class="hero-stats" id="hero-stats">
+          <div class="stat reveal"><dt>ROUTES</dt><dd data-stat="routes">—</dd></div>
+          <div class="stat reveal"><dt>ZONES</dt><dd data-stat="zones">—</dd></div>
+          <div class="stat reveal"><dt>SAAS</dt><dd data-stat="saas">—</dd></div>
+          <div class="stat reveal"><dt>TUNNEL</dt><dd data-stat="tunnel" class="stat-small">—</dd></div>
+        </dl>
+      </section>
+
+      <div class="marquee" aria-hidden="true">
+        <div class="marquee-line" id="marquee-a"></div>
+        <div class="marquee-line reverse" id="marquee-b"></div>
+      </div>
+
+      <!-- 01 LISTENERS -->
+      <section class="block" id="services">
+        <header class="block-head">
+          <span class="block-index">01</span>
+          <div>
+            <h2>LISTENERS</h2>
+            <p>本机正在监听的服务 · 直接映射到域名 <b class="head-count" id="count-services">—</b></p>
+          </div>
+          <div class="block-tools">
+            <input class="filter" id="services-filter" type="search" placeholder="过滤进程 / 端口 / 域名" aria-label="过滤服务">
+            <div class="seg" id="services-seg" role="group" aria-label="按映射状态过滤">
+              <button type="button" data-scope="all" class="on">全部</button>
+              <button type="button" data-scope="mapped">已映射</button>
+              <button type="button" data-scope="free">未映射</button>
+            </div>
+            <button class="ghost-btn" id="services-refresh" type="button">↻</button>
+          </div>
+        </header>
+        <div class="listener-list" id="listener-list" aria-live="polite">
+          <div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div>
+        </div>
+      </section>
+
+      <!-- 02 ROUTES -->
+      <section class="block" id="routes">
+        <header class="block-head">
+          <span class="block-index">02</span>
+          <div>
+            <h2>ROUTES</h2>
+            <p>隧道内的域名映射 · 改后端、切优选、拆掉 <b class="head-count" id="count-routes">—</b></p>
+          </div>
+          <div class="block-tools">
+            <input class="filter" id="routes-filter" type="search" placeholder="过滤域名 / 后端 / zone" aria-label="过滤域名">
+            <button class="ghost-btn" id="routes-refresh" type="button">↻</button>
+          </div>
+        </header>
+        <div class="route-grid" id="route-grid" aria-live="polite"></div>
+      </section>
+
+      <!-- 03 DIAGNOSTICS -->
+      <section class="block" id="diagnostics">
+        <header class="block-head">
+          <span class="block-index">03</span>
+          <div>
+            <h2>DIAGNOSTICS</h2>
+            <p>systemd · ingress · 后端 · SaaS · DNS 逐项验收</p>
+          </div>
+          <div class="block-tools">
+            <button class="btn btn-wire" id="diag-run" type="button"><span>运行体检</span></button>
+            <label class="switch"><input type="checkbox" id="diag-https"><i></i><span>含 HTTPS 实测</span></label>
+          </div>
+        </header>
+        <div class="diag-console" id="diag-console">
+          <div class="diag-empty" id="diag-empty">
+            尚未运行。体检会真实请求 Cloudflare API 并探测本地后端，耗时约 10–40s。
+          </div>
+          <ol class="diag-lines" id="diag-lines"></ol>
+        </div>
+      </section>
+
+      <!-- 04 JOURNAL -->
+      <section class="block" id="journal">
+        <header class="block-head">
+          <span class="block-index">04</span>
+          <div>
+            <h2>JOURNAL</h2>
+            <p>谁在什么时候动了什么 · 只读审计</p>
+          </div>
+          <div class="block-tools">
+            <button class="ghost-btn" id="journal-refresh" type="button">↻</button>
+          </div>
+        </header>
+        <div class="journal" id="journal-list"></div>
+      </section>
+
+      <footer class="foot">
+        <div class="foot-left">
+          <span class="foot-mark">ARC</span>
+          <p>cf-tunnel-accel console · 单文件标准库服务，复用 CLI 的全部云端逻辑</p>
+        </div>
+        <div class="foot-right">
+          <p>配置 <code id="foot-config">—</code></p>
+          <p>服务 <code id="foot-service">—</code></p>
+        </div>
+      </footer>
+    </div>
+  </div>
+</main>
+
+<!-- ░░░ JOB CONSOLE ░░░ -->
+<aside class="jobbar" id="jobbar" hidden aria-live="polite">
+  <div class="jobbar-head">
+    <span class="jobbar-op" id="jobbar-op">JOB</span>
+    <span class="jobbar-status" id="jobbar-status">queued</span>
+    <span class="jobbar-elapsed" id="jobbar-elapsed">0.0s</span>
+    <button class="ghost-btn" id="jobbar-toggle" type="button" aria-expanded="false">展开</button>
+  </div>
+  <div class="jobbar-progress"><span id="jobbar-progress"></span></div>
+  <ol class="jobbar-log" id="jobbar-log"></ol>
+</aside>
+
+<!-- ░░░ PALETTE ░░░ -->
+<div class="palette" id="palette" hidden role="dialog" aria-modal="true" aria-label="命令面板">
+  <div class="palette-box">
+    <input id="palette-input" type="text" placeholder="搜索域名 / 服务 / 动作…" autocomplete="off" spellcheck="false">
+    <ul class="palette-list" id="palette-list" role="listbox"></ul>
+    <p class="palette-foot"><kbd>↑↓</kbd> 选择 <kbd>↵</kbd> 执行 <kbd>Esc</kbd> 关闭</p>
+  </div>
+</div>
+
+<!-- ░░░ MODAL ░░░ -->
+<div class="modal" id="modal" hidden role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal-box" id="modal-box">
+    <header class="modal-head">
+      <p class="modal-kicker" id="modal-kicker">ACTION</p>
+      <h3 id="modal-title">标题</h3>
+    </header>
+    <div class="modal-body" id="modal-body"></div>
+    <footer class="modal-foot">
+      <button class="btn btn-wire" id="modal-cancel" type="button"><span>取消</span></button>
+      <button class="btn btn-solid" id="modal-ok" type="button"><span>确认</span></button>
+    </footer>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

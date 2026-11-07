@@ -1399,6 +1399,75 @@ def read_config_text() -> str:
         raise CFError(f"读取隧道配置失败 {CONFIG_PATH}: {exc}") from None
 
 
+def _find_ui_server() -> Path:
+    """定位 Web 控制台入口，找不到就返回第一个候选供报错展示。"""
+    override = env_str("CF_TUNNEL_ACCEL_UI_SERVER", "")
+    if override:
+        return Path(override)
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "ui" / "server.py",                                   # 脚本和 ui/ 一起安装
+        here.parent / "ui" / "server.py",
+        here.parent / "repos" / "cf-tunnel-accel" / "ui" / "server.py",
+        Path("/root/repos/cf-tunnel-accel/ui/server.py"),
+        Path("/usr/local/lib/cf-tunnel-accel/ui/server.py"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+UI_SERVER = _find_ui_server()
+UI_DIR = UI_SERVER.parent
+UI_UNIT = "cf-tunnel-ui.service"
+
+
+def launch_ui(extra_args: Optional[List[str]] = None) -> int:
+    """拉起 Web 控制台：优先用已安装的 systemd 服务，否则前台跑 ui/server.py。"""
+    if not UI_SERVER.is_file():
+        cprint(f"没有找到 Web 控制台: {UI_SERVER}", "red")
+        cprint(
+            "  从仓库里带上 ui/ 目录，或用 CF_TUNNEL_ACCEL_UI_SERVER=/实际/server.py 指定。",
+            "yellow",
+        )
+        return 1
+    active = run(["systemctl", "is-active", UI_UNIT], check=False, timeout=10)
+    if (active.stdout or "").strip() == "active" and not extra_args:
+        port = "8642"
+        token_file = Path(
+            os.environ.get(
+                "CF_TUNNEL_ACCEL_UI_TOKEN_FILE",
+                "/root/.config/cf-tunnel-accel/ui-token",
+            )
+        )
+        cprint(f"Web 控制台已在运行: {UI_UNIT}", "green")
+        host_ip = "127.0.0.1"
+        try:
+            import socket as _socket
+
+            probe = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            probe.settimeout(0.3)
+            try:
+                probe.connect(("8.8.8.8", 53))
+                host_ip = probe.getsockname()[0]
+            finally:
+                probe.close()
+        except OSError:
+            pass
+        cprint(f"  本机   http://127.0.0.1:{port}/", "cyan")
+        cprint(f"  局域网 http://{host_ip}:{port}/", "cyan")
+        cprint(f"  凭据   {token_file}", "cyan")
+        cprint(f"  查看凭据: cf-tunnel-accel ui --print-token", "yellow")
+        return 0
+    cmd = [sys.executable, "-u", str(UI_SERVER)] + list(extra_args or [])
+    cprint(f"启动 Web 控制台: {' '.join(cmd)}", "green")
+    try:
+        return subprocess.call(cmd)
+    except KeyboardInterrupt:
+        return 0
+
+
 def config_missing_hint() -> str:
     """隧道配置缺失时的统一提示（新服务器上最常见）。"""
     return (
@@ -3045,6 +3114,7 @@ def menu() -> None:
         cprint("  7) 全链路健康检查")
         cprint("  8) CDN 自动优选定时任务")
         cprint("  9) 查看账号可用域名（记不住域名时先看这里）")
+        cprint("  w) Web 控制台（图形界面，浏览器里增删改）")
         cprint("  0) 退出")
         choice = input("输入序号: ").strip()
         try:
@@ -3078,6 +3148,8 @@ def menu() -> None:
                     cprint("无效选项", "yellow")
             elif choice == "9":
                 print_domains()
+            elif choice in ("w", "W"):
+                launch_ui([])
             elif choice == "0":
                 cprint("再见。", "cyan")
                 return
@@ -3107,6 +3179,7 @@ def print_help() -> None:
         "  cf-tunnel-accel list\n"
         "  cf-tunnel-accel status                  # 简要状态与最近错误\n"
         "  cf-tunnel-accel health [域名] [--https] # 全链路诊断\n"
+        "  cf-tunnel-accel ui [--port 8642] [--host 0.0.0.0] # Web 控制台\n"
         "  cf-tunnel-accel switch <域名>\n"
         "  cf-tunnel-accel del <域名>\n"
         "  cf-tunnel-accel cdn show\n"
@@ -3223,6 +3296,8 @@ def _main_locked(argv: List[str]) -> int:
                     if not HOST_RE.match(health_host):
                         raise CFError(f"域名格式不正确: {health_host}")
                 return 0 if health_check(health_host, "--https" in argv or "-H" in argv) else 1
+            if cmd in ("ui", "web", "console"):
+                return launch_ui([a for a in argv[2:]])
             if cmd in ("del", "delete", "rm") and len(argv) >= 3:
                 remove_service(normalize_hostname(argv[2]))
                 return 0

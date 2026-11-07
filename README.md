@@ -24,8 +24,55 @@ Cloudflare Tunnel + **双域名（辅助域 SaaS）优选加速**一键脚本。
 | 6 | 全链路健康诊断（Tunnel / 后端 / SaaS / DNS / 可选 HTTPS） | `health [域名] [--https]` |
 | 7 | 可选 systemd 定时自动优选 | `schedule install [小时]` |
 | 8 | 查看当前生效的基础设施配置（换服务器核对） | `env` |
+| 9 | **Web 控制台 ARC**：浏览器里看本机服务、增删改域名、跑体检、看审计 | `ui` |
 
 外部域名（不在本账号、解析要手动加）也能用：`add x.yourdomain.com 127.0.0.1:8080 --external`，脚本会打印需要手动添加的 ownership / DCV / ACME 记录。
+
+## Web 控制台 ARC
+
+命令行之外还有一个图形界面，只依赖标准库，和 CLI 共用同一套云端逻辑（不重写任何
+Cloudflare 交互，避免两套实现互相打脸）。
+
+```bash
+cf-tunnel-accel ui                       # 已在跑就直接打印入口；否则前台拉起
+cf-tunnel-accel ui --host 0.0.0.0        # 前台这边改绑定
+cf-tunnel-accel ui --print-token         # 打印当前访问凭据
+python3 ui/server.py --port 8642         # 也可以直接跑（仓库内）
+```
+
+```
+http://127.0.0.1:8642/      本机
+http://<内网IP>:8642/        局域网（systemd 单元默认 0.0.0.0）
+凭据 ~/.config/cf-tunnel-accel/ui-token   # 0600，首次启动生成并打印一次
+```
+
+界面能力：
+
+| 区块 | 能做什么 |
+|---|---|
+| LISTENERS | 扫 `ss -ltnp` 出本机全部监听端口，带进程名/命令行/HTTP 探活/已映射域名，可按「全部 / 已映射 / 未映射」筛，一键把某个端口映射成域名 |
+| ROUTES | 隧道内所有域名卡片：后端、端口、zone、SaaS/SSL 状态；改后端、切优选入口、单域名体检、看详情、删除（要原样输入域名确认） |
+| DIAGNOSTICS | 跑 `health`，把 cloudflared / 后端 / SaaS / DNS 的输出实时逐行落进面板，PASS 绿、FAIL 红、WARN 琥珀 |
+| JOURNAL | 只读审计：谁在什么时候提交了什么任务、成功还是报错 |
+| 顶部拓扑 | 实时画「入口 → SaaS → 隧道 → 各后端」链路，域名点按状态着色，可拖动、悬停看域名、点击定位到卡片 |
+| 命令面板 | `⌘K / Ctrl+K` 搜域名、服务、动作，键盘直达 |
+
+安全设计（这几点在登录页明写，不是藏起来的）：
+
+- 默认只监听回环地址；要对外用 `--host 0.0.0.0`，此时**凭据就是唯一门槛**，单元里也写清了这一点。
+- 凭据是 48 位 hex，存于 0600 文件，恒定时间比较，页面永不回显。
+- 会话只存在 HttpOnly Cookie 里，页面脚本读不到；写操作另需 `arc_csrf` 双提交头，
+  并校验 `Origin` / `Sec-Fetch-Site`，跨站表单打不进来。
+- 登录失败按 IP 指数退避（3 次后 30s 起翻倍，上限 15 分钟），全部落审计。
+- 静态资源限定在 `ui/static/` 内，路径穿越一律 404；CSP 只放同源，禁内联脚本、禁被 iframe 嵌套。
+- 变更类任务串行执行（单 worker），避免两次隧道重启互相踩；删除必须二次确认且拒绝系统入口。
+
+安装成常驻服务：
+
+```bash
+sed "s#@UI_DIR@#$PWD/ui#" ui/cf-tunnel-ui.service > /etc/systemd/system/cf-tunnel-ui.service
+systemctl daemon-reload && systemctl enable --now cf-tunnel-ui
+```
 
 ## 依赖
 
@@ -167,6 +214,9 @@ git config --global http.proxy http://127.0.0.1:7890
 ## 测试
 
 ```bash
+python3 -m pytest tests -q      # CLI 逻辑（离线，23 项）
+python3 -m pytest ui/tests -q   # 控制台安全边界与解析（离线，18 项）
+
 python3 tests/test_cf_tunnel_accel.py        # 全离线，不碰真实账号
 CF_TUNNEL_ACCEL_SCRIPT=/path/to/script python3 tests/test_cf_tunnel_accel.py
 ```
