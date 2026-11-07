@@ -451,19 +451,19 @@ class JobRunner:
                 if os.environ.get("ARC_DEBUG"):
                     job.log(traceback.format_exc())
             finally:
-                # 先把进程级副作用收回、再宣告状态：轮询方看到 done/error 时，
-                # cprint 一定已经还原，job.ended 也一定有值。
                 accel.cprint = original  # type: ignore[assignment]
-                job.ended = time.time()
-                job.result = result
-                job.error = error
-                job.status = status
+            # 先落审计、再宣告状态：观察者看到 done/error 时，cprint 已还原、
+            # job.ended 有值、审计也已写完，不留任何“状态已到但副作用未完”的窗口。
             if status == "done":
                 self.audit.write("job.done", op=job.op, job=job.id, actor=job.actor)
             else:
                 self.audit.write(
                     "job.error", op=job.op, job=job.id, actor=job.actor, error=error
                 )
+            job.result = result
+            job.error = error
+            job.ended = time.time()
+            job.status = status
 
     def _dispatch(self, job: Job) -> Any:
         accel = self.accel

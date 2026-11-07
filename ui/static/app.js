@@ -889,11 +889,14 @@
         const ly = labelRight ? oy : oy - n.r - 15;
         ctx.textAlign = labelRight ? 'left' : 'center';
         ctx.fillText(String(n.label).toUpperCase(), lx, ly);
-        if (n.sub) {
-          // 主轴节点的副标题放到下方，避开左侧扇形与上方标签
+        // 窄屏就别塞副标题了，主轴三个节点的字会互相压住
+        const showSub = !labelRight && (W >= 560 || entryKind);
+        if (n.sub && (showSub || labelRight)) {
           ctx.font = '400 8px "Noto Sans Mono", ui-monospace, monospace';
           ctx.fillStyle = 'rgba(236,231,219,.34)';
-          const sub = String(n.sub).length > 28 ? `${String(n.sub).slice(0, 27)}…` : String(n.sub);
+          const raw = String(n.sub);
+          const limit = W >= 560 ? 28 : 18;
+          const sub = raw.length > limit ? `${raw.slice(0, limit - 1)}…` : raw;
           ctx.fillText(sub, labelRight ? lx : ox, labelRight ? ly + 11 : oy + n.r + 15);
         }
       });
