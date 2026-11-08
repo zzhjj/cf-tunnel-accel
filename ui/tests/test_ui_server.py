@@ -71,8 +71,6 @@ class FakeAccel:
     def _systemd_active(self):
         return True, "active"
 
-    def get_current_preferred_target(self, strict=False):
-        return "www.shopify.com"
 
     def resolve_zone(self, host):
         return ("example.org", "z1") if host.endswith("example.org") else None
@@ -112,6 +110,52 @@ class FakeAccel:
     def health_check(self, hostname=None, include_https=False):
         self.calls.append(("health", hostname, include_https))
         return True
+
+    # ---- 优选 CDN ----
+    CDN_CANDIDATES = ["fast.example", "slow.example"]
+    CDN_SWITCH_MIN_IMPROVEMENT_PERCENT = 15.0
+
+    def get_current_preferred_target(self, strict=False):
+        return "slow.example"
+
+    def ensure_candidate_list(self, extra=None):
+        return ["slow.example", "fast.example"]
+
+    def benchmark_cdn(self, domain, ping_count=4, tcp_tries=4):
+        self.calls.append(("bench", domain))
+        if domain == "fast.example":
+            return {
+                "domain": domain, "median_https": 40.0, "median_tcp": 30.0,
+                "avg_ttfb": 60.0, "best_ping": 10.0, "https_ok": 3, "https_tries": 3,
+                "https_success_rate": 1.0, "ip_count": 2, "best_tcp": 28.0,
+            }
+        return {
+            "domain": domain, "median_https": None, "median_tcp": 15.0,
+            "avg_ttfb": None, "best_ping": 8.0, "https_ok": 0, "https_tries": 3,
+            "https_success_rate": 0.0, "ip_count": 1, "best_tcp": 14.0,
+        }
+
+    def rank_cdn_results(self, results):
+        return sorted(results, key=lambda x: (x.get("https_ok", 0) == 0, x.get("median_https") or 1e9))
+
+    def cdn_latency_score(self, row):
+        if row.get("median_https") is not None and row.get("https_ok"):
+            return float(row["median_https"])
+        if row.get("median_tcp") is not None:
+            return float(row["median_tcp"])
+        return None
+
+    def set_preferred_target(self, target, note=""):
+        self.calls.append(("set_cdn", target))
+        return {}
+
+    def test_and_maybe_switch_cdn(self, auto_apply_best=False, candidates=None,
+                                 interactive=False, force=False):
+        self.calls.append(("auto_best", auto_apply_best))
+        if auto_apply_best:
+            self.calls.append(("set_cdn", "fast.example"))
+            return "fast.example"
+        return "slow.example"
 
 
 class ValidatorsTest(unittest.TestCase):
@@ -249,6 +293,60 @@ class JobTest(unittest.TestCase):
         self.assertTrue(any("改了 ingress" in t for t in texts))
         # 任务结束后必须恢复原来的 cprint，不能污染进程
         self.assertEqual(self.accel.cprint.__name__, "cprint")
+
+
+class CdnTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.audit = mod.Audit(Path(self.tmp.name) / "audit.log")
+        self.accel = FakeAccel()
+        self.runner = mod.JobRunner(self.accel, self.audit)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _wait(self, job, timeout=5.0):
+        import time
+        end = time.time() + timeout
+        while time.time() < end and job.ended is None:
+            time.sleep(0.02)
+        return job
+
+    def test_build_cdn_lists_candidates_and_current(self):
+        cdn = mod.build_cdn(self.accel)
+        self.assertEqual(cdn["entry"], "cdn.example.org")
+        self.assertEqual(cdn["target"], "slow.example")
+        domains = [c["domain"] for c in cdn["candidates"]]
+        self.assertEqual(domains[0], "slow.example")
+        self.assertTrue(cdn["candidates"][0]["current"])
+        self.assertEqual(cdn["min_improvement"], 15.0)
+
+    def test_cdn_test_never_writes(self):
+        job = self.runner.submit("cdn-test", {}, "t")
+        self._wait(job)
+        self.assertEqual(job.status, "done", job.error)
+        self.assertFalse([c for c in self.accel.calls if c[0] in ("set_cdn", "auto_best")])
+        result = job.result
+        self.assertEqual(result["best"], "fast.example")
+        by_domain = {r["domain"]: r for r in result["ranked"]}
+        self.assertTrue(by_domain["fast.example"]["usable"])
+        # HTTPS 全挂的候选即使 TCP 更快，也不能被当成可用
+        self.assertFalse(by_domain["slow.example"]["usable"])
+        self.assertEqual(result["ranked"][-1]["domain"], "slow.example")
+
+    def test_cdn_set_switches_target(self):
+        job = self.runner.submit("cdn-set", {"target": "fast.example"}, "t")
+        self._wait(job)
+        self.assertEqual(job.status, "done", job.error)
+        self.assertIn(("set_cdn", "fast.example"), self.accel.calls)
+        self.assertEqual(job.result["changed"], True)
+
+    def test_cdn_best_goes_through_auto_apply(self):
+        job = self.runner.submit("cdn-best", {}, "t")
+        self._wait(job)
+        self.assertEqual(job.status, "done", job.error)
+        self.assertIn(("auto_best", True), self.accel.calls)
+        self.assertEqual(job.result["target"], "fast.example")
 
 
 class StaticGuardTest(unittest.TestCase):

@@ -20,6 +20,8 @@
     state: null,
     services: [],
     journal: [],
+    cdn: null,
+    cdnRanked: null,
     filter: { services: '', routes: '', scope: 'all' },
     target: null,
     job: null,
@@ -303,6 +305,107 @@
     if (open) openDetail(host);
   }
 
+  /* ── CDN ──────────────────────────────────────────────── */
+  async function loadCdn() {
+    const data = await api('/api/cdn');
+    S.cdn = data.cdn;
+    renderCdn();
+  }
+
+  function renderCdn(ranked) {
+    const cdn = S.cdn;
+    if (!cdn) return;
+    if (ranked && ranked.length) S.cdnRanked = ranked;
+    $('#cdn-target').innerHTML = `${esc(cdn.target || '未设置')}<small>${esc(cdn.entry)} 已指向它</small>`;
+    $('#cdn-entry').textContent = cdn.entry;
+    setCount('count-cdn', `${cdn.candidates.length} 个候选`);
+
+    // 用最近一次测速结果渲染（切换后刷新 current 标记但保留测量值）
+    const measured = ranked && ranked.length ? ranked : S.cdnRanked;
+    const rows = measured && measured.length
+      ? measured.map((r) => ({ ...r, current: r.domain === cdn.target }))
+      : cdn.candidates.map((c) => ({ domain: c.domain, current: c.current }));
+    const alive = rows.filter((r) => r.usable !== false && r.score != null);
+    const best = alive.length ? Math.min(...alive.map((r) => r.score)) : null;
+
+    $('#cdn-candidates').innerHTML = rows.map((r) => {
+      const dead = r.usable === false || (r.success_rate != null && r.success_rate === 0);
+      const measured = r.score != null && !dead;
+      const width = measured
+        ? (best ? Math.max(6, Math.min(100, (best / r.score) * 100)) : 100)
+        : 3;
+      const label = dead
+        ? '—<small>不可用</small>'
+        : measured ? `${Math.round(r.score)}<small>MS HTTPS</small>` : '—<small>未测</small>';
+      const okRate = r.success_rate != null
+        ? `${Math.round(r.success_rate * 100)}% ${dead ? '不可用' : '可用'}`
+        : '';
+      const meta = [r.current ? '当前生效' : '候选', okRate, r.ip_count ? `${r.ip_count} IP` : '']
+        .filter(Boolean).join(' · ');
+      const isBest = measured && best != null && r.score === best;
+      return `<li class="cdn-row ${r.current ? 'is-current' : ''} ${isBest ? 'is-best' : ''} ${dead ? 'is-dead' : ''}" data-domain="${esc(r.domain)}">
+        <div class="cdn-domain">${esc(r.domain)}<span>${esc(meta)}</span></div>
+        <div class="cdn-bar"><span style="width:${width}%"></span></div>
+        <div class="cdn-ms">${label}</div>
+        <div class="cdn-act">
+          <button data-cdn-set="${esc(r.domain)}" ${r.current ? 'disabled' : ''}>
+            ${r.current ? '使用中' : dead ? '仍要切换' : '切到这里'}
+          </button>
+        </div>
+      </li>`;
+    }).join('');
+
+    $$('[data-cdn-set]').forEach((b) => b.addEventListener('click', () => confirmCdnSet(b.dataset.cdnSet)));
+  }
+
+  function confirmCdnSet(target) {
+    const cdn = S.cdn || {};
+    const row = ($(`.cdn-row[data-domain="${CSS.escape(target)}"]`));
+    const dead = row && row.classList.contains('is-dead');
+    const warn = dead
+      ? '<p class="cdn-warn">这次测速里它 HTTPS 采样全军覆没（0% 可用），切过去等于把所有域名指向一个连不上的落点。</p>'
+      : '';
+    const body = el('div', '', `${warn}<p>把优选入口 <code>${esc(cdn.entry || '')}</code> 的 CNAME
+      从 <code>${esc(cdn.target || '—')}</code> 改成 <code>${esc(target)}</code>。</p>
+      <p>影响面：<b>全部 ${S.state ? S.state.counts.routes : '—'} 个域名</b>的加速入口，立即生效（TTL 120s）。
+      切完会等 API 确认，确认不到会自动报错。</p>`);
+    openModal({
+      kicker: 'SWITCH CDN',
+      title: '切换优选 CDN',
+      body,
+      okLabel: '确认切换',
+      onOk: async () => {
+        $('#modal').hidden = true;
+        await runJob({ op: 'cdn-set', target, confirm: target });
+        return false;
+      },
+    });
+  }
+
+  function confirmCdnBest() {
+    const cdn = S.cdn || {};
+    const body = el('div', '', `<p>先实测所有候选，再按 HTTPS 中位数 / TTFB / TCP 排序，
+      只有比当前目标改善 <b>≥ ${esc(String(cdn.min_improvement ?? 15))}%</b> 才会真正切换。</p>
+      <p>测速会跑 ping / TCP / TLS 三类样本，约 20–60s；期间日志会实时显示在下方。</p>`);
+    openModal({
+      kicker: 'AUTO BEST',
+      title: '测速并切到最优',
+      body,
+      okLabel: '开始测速',
+      onOk: async () => {
+        $('#modal').hidden = true;
+        await runJob({ op: 'cdn-best' });
+        return false;
+      },
+    });
+  }
+
+  function cdnLine(cls, t, msg) {
+    const li = el('li', cls);
+    li.innerHTML = `<span class="t">${t.toFixed(1)}s</span><span class="m">${esc(msg)}</span>`;
+    return li;
+  }
+
   /* ── JOURNAL ──────────────────────────────────────────── */
   function renderJournal() {
     const box = $('#journal-list');
@@ -343,15 +446,22 @@
     }
     jobBar(payload);
     S.job = { since: 0, id: null };
+    let started;
     try {
-      const started = await api('/api/jobs', { method: 'POST', body: payload });
-      const id = started.job.id;
-      S.job.id = id;
-      await pollJob(id);
+      started = await api('/api/jobs', { method: 'POST', body: payload });
     } catch (err) {
       $('#jobbar-status').textContent = 'error';
       $('#jobbar-status').className = 'jobbar-status err';
       toast('任务未能提交', err.message, 'bad');
+      S.job = null;
+      return;
+    }
+    S.job.id = started.job.id;
+    try {
+      await pollJob(started.job.id);
+    } catch (err) {
+      // 任务本身可能已经成功，这里只是收尾渲染出问题，不能谎报提交失败
+      toast('任务已执行，界面刷新出错', err.message, 'warn');
       S.job = null;
     }
   }
@@ -383,6 +493,15 @@
       const job = res.job;
       if (job.lines && job.lines.length) {
         appendJobLines(job.lines);
+        if (job.op.startsWith('cdn')) {
+          const log = $('#cdn-log');
+          log.classList.add('has-lines');
+          job.lines.forEach((l) => {
+            const best = /最优|本机测速最优/.test(l.m);
+            log.append(cdnLine(best ? 'best' : '', l.t, l.m));
+          });
+          log.scrollTop = log.scrollHeight;
+        }
         if (job.op === 'health') job.lines.forEach((l) => {
           const cls = /FAIL/.test(l.m) ? 'fail' : /WARN/.test(l.m) ? 'warn'
             : /PASS/.test(l.m) ? 'pass' : /^\s*======/.test(l.m) ? 'head' : 'info';
@@ -410,6 +529,16 @@
         S.job = null;
         await Promise.all([loadState(), loadServices(false), loadJournal()]);
         renderTicker();
+        if (job.op.startsWith('cdn')) {
+          if (job.result && job.result.ranked) renderCdn(job.result.ranked);
+          else renderCdn();
+          if (job.result && job.result.changed) {
+            toast('优选已切换', `${job.result.before || '—'} → ${job.result.target}`, '');
+          } else if (job.op === 'cdn-best') {
+            toast('保持当前 CDN', '没有候选达到切换阈值', 'warn');
+          }
+          await loadCdn();
+        }
         if (job.op === 'health') {
           const ok = job.result && job.result.ok;
           const li = el('li', ok ? 'pass' : 'fail');
@@ -1037,7 +1166,7 @@
   }
 
   async function refreshAll() {
-    await Promise.all([loadState(), loadServices(true), loadJournal()]);
+    await Promise.all([loadState(), loadServices(true), loadJournal(), loadCdn()]);
     renderTicker();
     toast('已刷新', 'state / services / audit');
   }
@@ -1052,7 +1181,9 @@
     initRail();
     initCursor();
     Topology.init($('#topology'));
-    const results = await Promise.allSettled([loadState(), loadServices(true), loadJournal()]);
+    const results = await Promise.allSettled([
+      loadState(), loadServices(true), loadJournal(), loadCdn(),
+    ]);
     const failed = results.filter((r) => r.status === 'rejected');
     if (failed.length) {
       failed.forEach((f) => toast('部分数据加载失败', f.reason?.message || '', 'warn'));
@@ -1116,6 +1247,24 @@
     $('#services-refresh').addEventListener('click', () => loadServices(true).then(() => toast('已刷新', 'listeners')));
     $('#routes-refresh').addEventListener('click', () => loadState().then(() => toast('已刷新', 'routes')));
     $('#journal-refresh').addEventListener('click', () => loadJournal().then(() => toast('已刷新', 'journal')));
+    $('#cdn-test').addEventListener('click', () => {
+      const log = $('#cdn-log');
+      log.innerHTML = '';
+      log.classList.add('has-lines');
+      runJob({ op: 'cdn-test' });
+    });
+    $('#cdn-best').addEventListener('click', () => confirmCdnBest());
+    const manualGo = () => {
+      const raw = ($('#cdn-manual').value || '').trim().toLowerCase().replace(/\.$/, '');
+      const okHost = /^(?=.{4,253}$)(?!-)[a-z0-9-]{1,63}(?<!-)(\.[a-z0-9-]{1,63})+$/.test(raw);
+      if (!okHost) {
+        toast('域名格式不合法', raw || '(空)', 'warn');
+        return;
+      }
+      confirmCdnSet(raw);
+    };
+    $('#cdn-manual-go').addEventListener('click', manualGo);
+    $('#cdn-manual').addEventListener('keydown', (e) => { if (e.key === 'Enter') manualGo(); });
     $('#logout').addEventListener('click', logout);
     $('#jobbar-toggle').addEventListener('click', (e) => {
       const bar = $('#jobbar');

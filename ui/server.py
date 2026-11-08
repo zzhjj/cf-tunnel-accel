@@ -49,6 +49,9 @@ CONFIG_DIR = Path(
 TOKEN_PATH = Path(
     os.environ.get("CF_TUNNEL_ACCEL_UI_TOKEN_FILE", str(CONFIG_DIR / "ui-token"))
 )
+CDN_HISTORY_PATH = Path(
+    os.environ.get("CF_TUNNEL_ACCEL_UI_CDN_HISTORY", str(CONFIG_DIR / "ui-cdn-history.json"))
+)
 AUDIT_PATH = Path(
     os.environ.get("CF_TUNNEL_ACCEL_UI_AUDIT", str(CONFIG_DIR / "ui-audit.log"))
 )
@@ -137,6 +140,62 @@ class Audit:
         with self.lock:
             rows = list(self.recent)
         return rows[-limit:][::-1]
+
+
+class CdnHistory:
+    """记住用过/见过的优选目标。
+
+    内置候选是写死的公共列表，一旦切到列表外的目标（比如 www.shopify.com），
+    下次 build_cdn 就拿不到它，界面里就再也切不回去了——这个文件正是补这个洞。
+    """
+
+    MAX = 8
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.items: List[dict] = self._load()
+
+    def _load(self) -> List[dict]:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if isinstance(data, dict):
+            data = data.get("targets") or []
+        out = []
+        for row in data if isinstance(data, list) else []:
+            if isinstance(row, dict) and row.get("domain"):
+                out.append({"domain": str(row["domain"]), "ts": row.get("ts") or 0})
+            elif isinstance(row, str):
+                out.append({"domain": row, "ts": 0})
+        return out[: self.MAX]
+
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"targets": self.items}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def note(self, domain: str) -> None:
+        if not domain:
+            return
+        with self.lock:
+            self.items = [i for i in self.items if i["domain"] != domain]
+            self.items.insert(0, {"domain": domain, "ts": int(time.time())})
+            self.items = self.items[: self.MAX]
+            self._save()
+
+    def domains(self) -> List[str]:
+        with self.lock:
+            return [i["domain"] for i in self.items]
 
 
 class Sessions:
@@ -343,6 +402,10 @@ def discover_services(accel, with_probe: bool = True) -> List[dict]:
 # --------------------------------------------------------------------------
 # 任务队列（单一 worker，保证隧道重启不会互相踩）
 # --------------------------------------------------------------------------
+def _ms(value: Any) -> str:
+    return "-" if value is None else f"{float(value):.2f}ms"
+
+
 class Job:
     def __init__(self, op: str, args: dict, actor: str):
         self.id = secrets.token_hex(8)
@@ -465,6 +528,62 @@ class JobRunner:
             job.ended = time.time()
             job.status = status
 
+    def _cdn_bench(self, job: Job) -> dict:
+        """只测速，绝不改 DNS。"""
+        accel = self.accel
+        try:
+            current = accel.get_current_preferred_target(strict=False)
+        except Exception:  # noqa: BLE001
+            current = ""
+        domains = accel.ensure_candidate_list()
+        job.log(f"当前优选目标: {current or '(未知)'}")
+        job.log(f"候选 {len(domains)} 个: {', '.join(domains)}")
+        raw = []
+        for i, domain in enumerate(domains, 1):
+            job.log(f"[{i}/{len(domains)}] 测速 {domain} …")
+            try:
+                raw.append(accel.benchmark_cdn(domain))
+            except Exception as exc:  # noqa: BLE001
+                job.log(f"    跳过 {domain}: {exc}")
+        if not raw:
+            raise RuntimeError("没有测出任何候选 CDN 的可用样本")
+        ranked = accel.rank_cdn_results(raw)
+        out = []
+        for row in ranked:
+            score = accel.cdn_latency_score(row)
+            # cdn_latency_score 会退化到 TCP：HTTPS 全挂时也有“分数”，
+            # 但那种候选切过去等于把全部域名弄挂，必须单独标不可用。
+            usable = bool(row.get("https_ok")) and score is not None
+            out.append(
+                {
+                    "domain": row["domain"],
+                    "current": row["domain"] == current,
+                    "usable": usable,
+                    "score": score,
+                    "median_https": row.get("median_https"),
+                    "median_tcp": row.get("median_tcp"),
+                    "avg_ttfb": row.get("avg_ttfb"),
+                    "best_ping": row.get("best_ping"),
+                    "success_rate": row.get("https_success_rate"),
+                    "https_ok": row.get("https_ok"),
+                    "https_tries": row.get("https_tries"),
+                    "ip_count": row.get("ip_count"),
+                }
+            )
+            mark = " [当前]" if row["domain"] == current else ""
+            job.log(
+                f"    {row['domain']}{mark}  "
+                f"https={_ms(row.get('median_https'))}  "
+                f"ttfb={_ms(row.get('avg_ttfb'))}  "
+                f"ok={row.get('https_ok')}/{row.get('https_tries')}  "
+                f"ips={row.get('ip_count')}"
+            )
+        best = next((r["domain"] for r in out if r["usable"]), None)
+        job.log(f"本机测速最优: {best or '(无)'}")
+        limit = getattr(accel, "CDN_SWITCH_MIN_IMPROVEMENT_PERCENT", 15.0)
+        job.log(f"自动切换阈值: 需改善 ≥ {limit:.1f}%")
+        return {"current": current, "best": best, "ranked": out, "min_improvement": limit}
+
     def _dispatch(self, job: Job) -> Any:
         accel = self.accel
         a = job.args
@@ -490,6 +609,22 @@ class JobRunner:
         if job.op == "health":
             ok = accel.health_check(a.get("hostname") or None, include_https=bool(a.get("https")))
             return {"ok": bool(ok), "hostname": a.get("hostname")}
+        if job.op == "cdn-test":
+            return self._cdn_bench(job)
+        if job.op == "cdn-set":
+            before = accel.get_current_preferred_target(strict=True)
+            CDN_HISTORY.note(before)
+            accel.set_preferred_target(a["target"])
+            CDN_HISTORY.note(a["target"])
+            return {"before": before, "target": a["target"], "changed": before != a["target"]}
+        if job.op == "cdn-best":
+            before = accel.get_current_preferred_target(strict=True)
+            CDN_HISTORY.note(before)
+            chosen = accel.test_and_maybe_switch_cdn(
+                auto_apply_best=True, interactive=False, force=bool(a.get("force"))
+            )
+            CDN_HISTORY.note(chosen)
+            return {"before": before, "target": chosen, "changed": chosen != before}
         if job.op == "repair":
             # 一键把某个域名的入口 CNAME 拉回优选入口
             accel.switch_to_preferred(a["hostname"])
@@ -562,6 +697,39 @@ def build_state(accel) -> dict:
             "zones": len(accel._zone_info),  # noqa: SLF001
             "saas": len(custom),
         },
+    }
+
+
+CDN_HISTORY = CdnHistory(CDN_HISTORY_PATH)
+
+
+def build_cdn(accel) -> dict:
+    """优选入口的当前目标与候选清单（只读，不发写请求）。"""
+    try:
+        current = accel.get_current_preferred_target(strict=False)
+    except Exception:  # noqa: BLE001
+        current = getattr(accel, "PREFERRED_TARGET", "")
+    try:
+        candidates = accel.ensure_candidate_list()
+    except Exception:  # noqa: BLE001
+        candidates = list(getattr(accel, "CDN_CANDIDATES", []))
+    if current and current not in candidates:
+        candidates = [current] + candidates
+    builtin = set(candidates)
+    # 当前目标第一次出现就记进历史，免得重启后列表里没有它
+    if current and current not in CDN_HISTORY.domains():
+        CDN_HISTORY.note(current)
+    for domain in CDN_HISTORY.domains():
+        if domain not in builtin and domain not in candidates:
+            candidates.append(domain)
+    return {
+        "entry": accel.PREFERRED_ENTRY,
+        "target": current,
+        "candidates": [
+            {"domain": d, "current": d == current, "builtin": d in builtin}
+            for d in candidates
+        ],
+        "min_improvement": getattr(accel, "CDN_SWITCH_MIN_IMPROVEMENT_PERCENT", 15.0),
     }
 
 
@@ -834,6 +1002,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and parts == ["services"]:
             probe = params.get("probe", ["1"])[0] != "0"
             return self._json(200, {"ok": True, "services": discover_services(accel, probe)})
+        if method == "GET" and parts == ["cdn"]:
+            return self._json(200, {"ok": True, "cdn": build_cdn(accel)})
         if method == "GET" and parts == ["audit"]:
             limit = min(200, int(params.get("limit", ["50"])[0] or 50))
             return self._json(200, {"ok": True, "rows": app.audit.tail(limit)})
@@ -868,7 +1038,10 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and parts == ["jobs"]:
             body = self._body()
             op = str(body.get("op") or "")
-            if op not in ("add", "update", "delete", "switch", "health", "repair"):
+            if op not in (
+                "add", "update", "delete", "switch", "health", "repair",
+                "cdn-test", "cdn-set", "cdn-best",
+            ):
                 return self._error(400, "未知操作")
             try:
                 if op in ("add", "update", "delete", "switch"):
@@ -882,7 +1055,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(400, "删除确认不匹配（需原样输入域名）")
                 if body["hostname"] in (accel.FALLBACK_ORIGIN, accel.PREFERRED_ENTRY):
                     return self._error(400, "系统入口不允许删除")
-            if op in ("add", "update", "delete", "switch", "repair"):
+            if op in ("cdn-set", "cdn-best"):
+                if op == "cdn-set":
+                    try:
+                        target = validate_hostname(body.get("target"))
+                    except ValueError as exc:
+                        return self._error(400, f"CDN 目标不合法: {exc}")
+                    if body.get("confirm") != target:
+                        return self._error(400, "切换确认不匹配（需原样输入 CDN 域名）")
+                    body["target"] = target
+                body["force"] = bool(body.get("force"))
+            if op in ("add", "update", "delete", "switch", "repair", "cdn-set", "cdn-best"):
                 if app.runner.active():
                     return self._error(409, "已有变更任务在执行，稍后重试")
             job = app.runner.submit(op, body, actor=self._ip())

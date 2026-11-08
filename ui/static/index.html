@@ -90,8 +90,9 @@
     <nav class="rail" aria-label="章节导航">
       <a href="#services" data-rail="services"><i>01</i><span>listeners</span></a>
       <a href="#routes" data-rail="routes"><i>02</i><span>routes</span></a>
-      <a href="#diagnostics" data-rail="diagnostics"><i>03</i><span>diagnostics</span></a>
-      <a href="#journal" data-rail="journal"><i>04</i><span>journal</span></a>
+      <a href="#cdn" data-rail="cdn"><i>03</i><span>cdn</span></a>
+      <a href="#diagnostics" data-rail="diagnostics"><i>04</i><span>diagnostics</span></a>
+      <a href="#journal" data-rail="journal"><i>05</i><span>journal</span></a>
       <div class="rail-progress"><span id="rail-bar"></span></div>
     </nav>
 
@@ -183,10 +184,45 @@
         <div class="route-grid" id="route-grid" aria-live="polite"></div>
       </section>
 
-      <!-- 03 DIAGNOSTICS -->
-      <section class="block" id="diagnostics">
+      <!-- 03 CDN -->
+      <section class="block" id="cdn">
         <header class="block-head">
           <span class="block-index">03</span>
+          <div>
+            <h2>CDN</h2>
+            <p>优选入口换区 · 本机出口实测后再动手 <b class="head-count" id="count-cdn">—</b></p>
+          </div>
+          <div class="block-tools">
+            <button class="btn btn-wire" id="cdn-test" type="button"><span>测速全部</span></button>
+            <button class="btn btn-solid" id="cdn-best" type="button"><span>一键切最优</span></button>
+          </div>
+        </header>
+
+        <div class="cdn-panel">
+          <div class="cdn-now">
+            <p class="cdn-kicker">CURRENT TARGET</p>
+            <p class="cdn-target" id="cdn-target">—</p>
+            <p class="cdn-entry">入口 <code id="cdn-entry">—</code> · 关橙云 · TTL 120s</p>
+            <div class="cdn-manual">
+              <input id="cdn-manual" type="text" placeholder="手动输入 CDN 域名，如 www.shopify.com"
+                     aria-label="手动指定优选 CDN 目标" autocomplete="off" spellcheck="false">
+              <button class="ghost-btn" id="cdn-manual-go" type="button">切换</button>
+            </div>
+            <p class="cdn-note" id="cdn-note">
+              测速取本机出口的 HTTPS 中位数与 TTFB，只统计成功样本；
+              「一键切最优」需改善超过阈值才会真正改 DNS。
+            </p>
+          </div>
+          <ul class="cdn-list" id="cdn-candidates" aria-live="polite"></ul>
+        </div>
+
+        <ol class="cdn-log" id="cdn-log" aria-live="polite"></ol>
+      </section>
+
+      <!-- 04 DIAGNOSTICS -->
+      <section class="block" id="diagnostics">
+        <header class="block-head">
+          <span class="block-index">04</span>
           <div>
             <h2>DIAGNOSTICS</h2>
             <p>systemd · ingress · 后端 · SaaS · DNS 逐项验收</p>
@@ -207,7 +243,7 @@
       <!-- 04 JOURNAL -->
       <section class="block" id="journal">
         <header class="block-head">
-          <span class="block-index">04</span>
+          <span class="block-index">05</span>
           <div>
             <h2>JOURNAL</h2>
             <p>谁在什么时候动了什么 · 只读审计</p>

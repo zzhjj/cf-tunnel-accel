@@ -52,6 +52,7 @@ http://<内网IP>:8642/        局域网（systemd 单元默认 0.0.0.0）
 |---|---|
 | LISTENERS | 扫 `ss -ltnp` 出本机全部监听端口，带进程名/命令行/HTTP 探活/已映射域名，可按「全部 / 已映射 / 未映射」筛，一键把某个端口映射成域名 |
 | ROUTES | 隧道内所有域名卡片：后端、端口、zone、SaaS/SSL 状态；改后端、切优选入口、单域名体检、看详情、删除（要原样输入域名确认） |
+| CDN | 优选入口换区：本机出口实测每个候选（ping/TCP/TLS/TTFB），按可用率与中位数排名；可「测速全部」「一键切最优」（阈值内不动 DNS）、按行切换、或手动输入任意 CDN 域名；日志实时流式输出 |
 | DIAGNOSTICS | 跑 `health`，把 cloudflared / 后端 / SaaS / DNS 的输出实时逐行落进面板，PASS 绿、FAIL 红、WARN 琥珀 |
 | JOURNAL | 只读审计：谁在什么时候提交了什么任务、成功还是报错 |
 | 顶部拓扑 | 实时画「入口 → SaaS → 隧道 → 各后端」链路，域名点按状态着色，可拖动、悬停看域名、点击定位到卡片 |
@@ -66,6 +67,10 @@ http://<内网IP>:8642/        局域网（systemd 单元默认 0.0.0.0）
 - 登录失败按 IP 指数退避（3 次后 30s 起翻倍，上限 15 分钟），全部落审计。
 - 静态资源限定在 `ui/static/` 内，路径穿越一律 404；CSP 只放同源，禁内联脚本、禁被 iframe 嵌套。
 - 变更类任务串行执行（单 worker），避免两次隧道重启互相踩；删除必须二次确认且拒绝系统入口。
+- **切 CDN 会影响全部域名的入口**，所以：必须先实测、切换要二次确认、按钮文案直接写「影响面：全部 N 个域名」，
+  测速全挂（HTTPS 0% 可用）的候选在确认弹窗里用红字劝退——但不禁用，留给你自己判断。
+- 切走的旧目标会记进 `~/.config/cf-tunnel-accel/ui-cdn-history.json`（0600），
+  所以切到内置候选列表以外的目标（例如 `www.shopify.com`）之后，界面里仍然能一键切回来。
 
 安装成常驻服务：
 
@@ -215,7 +220,7 @@ git config --global http.proxy http://127.0.0.1:7890
 
 ```bash
 python3 -m pytest tests -q      # CLI 逻辑（离线，23 项）
-python3 -m pytest ui/tests -q   # 控制台安全边界与解析（离线，18 项）
+python3 -m pytest ui/tests -q   # 控制台安全边界、CDN 换区、任务语义（离线，22 项）
 
 python3 tests/test_cf_tunnel_accel.py        # 全离线，不碰真实账号
 CF_TUNNEL_ACCEL_SCRIPT=/path/to/script python3 tests/test_cf_tunnel_accel.py
