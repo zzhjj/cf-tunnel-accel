@@ -105,6 +105,18 @@ def load_or_create_token() -> Tuple[str, bool]:
     return token, True
 
 
+def _no_verify_for(args: dict) -> bool:
+    """https 源站默认跳过证书校验。
+
+    HTTP 层已经按同样规则补过默认值；这里再兜一次，是因为任务也可能由内部
+    调用方直接提交（测试、脚本），不该指望上游一定填好。
+    """
+    raw = args.get("no_tls_verify")
+    if raw is None:
+        return str(args.get("service") or "").startswith("https://")
+    return bool(raw)
+
+
 class TTLCache:
     """极简 TTL 缓存。
 
@@ -633,12 +645,17 @@ class JobRunner:
         a = job.args
         if job.op == "add":
             accel.add_accelerated_service(
-                a["hostname"], a["service"], external=bool(a.get("external"))
+                a["hostname"],
+                a["service"],
+                external=bool(a.get("external")),
+                no_tls_verify=_no_verify_for(a),
             )
             return {"hostname": a["hostname"]}
         if job.op == "update":
             before = accel.read_config_text()
-            changed = accel.upsert_tunnel_hostname(a["hostname"], a["service"])
+            changed = accel.upsert_tunnel_hostname(
+                a["hostname"], a["service"], _no_verify_for(a)
+            )
             if changed:
                 accel.validate_and_restart_tunnel(rollback_text=before)
             else:
@@ -685,7 +702,9 @@ def build_state(accel, force: bool = False) -> dict:
 
 def _build_state(accel) -> dict:
     accel.ensure_zone_cache()
-    routes = accel.parse_ingress_hostnames(accel.read_config_text() or "")
+    entries = accel.parse_ingress_entries(accel.read_config_text() or "")
+    routes = [(e["hostname"], e["service"]) for e in entries]
+    entry_by_host = {e["hostname"]: e for e in entries}
     custom: Dict[str, dict] = {}
     try:
         custom = {
@@ -718,6 +737,7 @@ def _build_state(accel) -> dict:
             {
                 "hostname": host,
                 "service": service,
+                "no_tls_verify": bool((entry_by_host.get(host) or {}).get("no_tls_verify")),
                 "zone": zone[0] if zone else None,
                 "external": zone is None,
                 "saas": {
@@ -786,11 +806,16 @@ def _build_cdn(accel) -> dict:
 
 
 def build_host(accel, hostname: str, with_https: bool = False) -> dict:
-    routes = dict(accel.parse_ingress_hostnames(accel.read_config_text() or ""))
+    entries = {
+        e["hostname"]: e
+        for e in accel.parse_ingress_entries(accel.read_config_text() or "")
+    }
+    routes = {h: e["service"] for h, e in entries.items()}
     zone = accel.resolve_zone(hostname)
     out: Dict[str, Any] = {
         "hostname": hostname,
         "service": routes.get(hostname),
+        "no_tls_verify": bool((entries.get(hostname) or {}).get("no_tls_verify")),
         "zone": zone[0] if zone else None,
         "zone_id": zone[1] if zone else None,
     }
@@ -815,8 +840,14 @@ def build_host(accel, hostname: str, with_https: bool = False) -> dict:
             out["dns_error"] = str(exc)
     if out.get("service"):
         ok, detail = accel.probe_local_backend(
-            out["service"], timeout=3, host_header=hostname
+            out["service"],
+            timeout=3,
+            host_header=hostname,
+            no_tls_verify=out["no_tls_verify"],
         )
+        if (out["service"] or "").startswith("https://") and not out["no_tls_verify"]:
+            detail += "；缺 originRequest.noTLSVerify，经隧道会 502"
+            ok = False
         out["probe"] = {"ok": bool(ok), "detail": detail}
     if with_https:
         try:
@@ -1101,6 +1132,11 @@ class Handler(BaseHTTPRequestHandler):
                     body["hostname"] = validate_hostname(body.get("hostname"))
                 if op in ("add", "update"):
                     body["service"] = validate_service(body.get("service"))
+                    # https 源站默认跳过证书校验；显式传 false 可以关掉
+                    if body.get("no_tls_verify") is None:
+                        body["no_tls_verify"] = body["service"].startswith("https://")
+                    else:
+                        body["no_tls_verify"] = bool(body["no_tls_verify"])
             except ValueError as exc:
                 return self._error(400, str(exc))
             if op == "delete":

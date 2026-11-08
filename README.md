@@ -33,6 +33,37 @@ Cloudflare Tunnel + **双域名（辅助域 SaaS）优选加速**一键脚本。
 命令行之外还有一个图形界面，只依赖标准库，和 CLI 共用同一套云端逻辑（不重写任何
 Cloudflare 交互，避免两套实现互相打脸）。
 
+### https 后端（自签证书）必须带 noTLSVerify
+
+局域网里的 https 后端——路由器管理页（iKuai）、NAS、自建面板——几乎都是自签证书，
+证书里通常**没有 IP SAN**。cloudflared 默认校验源站证书，于是：
+
+```
+ERR Unable to reach the origin service ... tls: failed to verify certificate:
+    x509: cannot validate certificate for 192.168.8.1 because it doesn't contain any IP SANs
+→ 浏览器看到 502
+```
+
+处理方式是在该 ingress 项里加 `originRequest.noTLSVerify: true`：
+
+```yaml
+  - hostname: ikuai.261119.xyz
+    service: https://192.168.8.1:443
+    originRequest:
+      noTLSVerify: true
+```
+
+现在这一步是自动的：
+
+| 入口 | 行为 |
+|---|---|
+| CLI | `add <域名> https://192.168.8.1:443` 自动写入；`--verify` 可强制校验证书，`--no-verify` 强制跳过 |
+| 控制台 | 改后端弹窗里 https 自动勾上「跳过源站证书校验」，可手动取消；卡片上显示 `→ tls noTLSVerify`，缺失时红字提示 |
+| 探活 | https 源站先用默认校验探测，证书过不了自动换不校验重试，并在结果里标「源站证书未校验」 |
+| 健康检查 | https 源站缺 noTLSVerify 直接判 FAIL 并说明「经隧道会 502」，不再假装 PASS |
+
+回到 http 后端时该 `originRequest` 块会被自动删干净，不留死配置。
+
 ### 视觉：印刷编辑版（纸／墨／朱砂）
 
 刻意避开「深色终端风」——一屏基础设施界面也可以是纸上的版面：

@@ -1482,6 +1482,18 @@ button.chip:hover { color: var(--vermilion-ink); border-color: var(--vermilion);
 }
 .quick-list button:hover { color: var(--vermilion-ink); border-color: var(--vermilion); }
 
+/* 改后端弹窗里的 noTLSVerify 开关 */
+.tls-switch { margin: 4px 0 2px; gap: 9px; text-transform: none; letter-spacing: .02em; font-size: 11.5px; color: var(--ink-2); }
+.tls-switch span { letter-spacing: .02em; }
+.hint-line {
+  font-size: 11.5px !important;
+  line-height: 1.75;
+  color: var(--ink-3) !important;
+  padding-left: 10px;
+  border-left: 2px solid var(--rule-2);
+}
+.warn-ink { font-style: normal; color: var(--vermilion-ink); }
+
 /* ── 提示条 ───────────────────────────────────────────── */
 .toasts {
   position: fixed;

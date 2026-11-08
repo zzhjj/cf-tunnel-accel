@@ -264,6 +264,7 @@
         </div>
         <div class="route-meta">
           <div><span>→ backend</span><b title="${esc(r.service)}">${esc(scheme || '')}://${esc(hostport || '')}</b></div>
+          ${scheme === 'https' ? `<div><span>→ tls</span><b>${r.no_tls_verify ? 'noTLSVerify' : '<em class="warn-ink">缺 noTLSVerify</em>'}</b></div>` : ''}
           <div><span>port</span><b>${esc(port || '—')}</b></div>
         </div>
         <div class="route-badges">${saasBadge(r.saas)}</div>
@@ -666,18 +667,38 @@
 
   function openEditModal(host) {
     const route = S.state.routes.find((r) => r.hostname === host) || {};
-    const body = el('div', '', `${fieldHtml({ label: `新后端 · ${host}`, id: 'f-svc', value: route.service || '', placeholder: 'http://127.0.0.1:8080' })}
+    const body = el('div', '', `${fieldHtml({ label: `新后端 · ${host}`, id: 'f-svc', value: route.service || '', placeholder: 'http://127.0.0.1:8080 或 https://192.168.8.1:443' })}
+      <label class="switch tls-switch" for="f-notls">
+        <input type="checkbox" id="f-notls" ${route.no_tls_verify ? 'checked' : ''}>
+        <i></i><span>跳过源站证书校验（noTLSVerify）</span>
+      </label>
+      <p class="hint-line">https 源站默认勾选：局域网里的路由器/NAS 多是自签证书、证书里也没有 IP SAN，
+        cloudflared 校验不过会直接 502。判定由每次访问的结果说话，勾错就看得到报错。</p>
       <p>只改隧道 ingress 指向，不动 DNS 与 SaaS。会重启一次隧道（约 20s）。</p>`);
+    const svcInput = $('#f-svc', body);
+    const tlsBox = $('#f-notls', body);
+    svcInput.addEventListener('input', () => {
+      const isHttps = svcInput.value.trim().toLowerCase().startsWith('https://');
+      const dirty = tlsBox.dataset.touched === '1';
+      if (!dirty) tlsBox.checked = isHttps;
+    });
+    tlsBox.addEventListener('change', () => { tlsBox.dataset.touched = '1'; });
     openModal({
       kicker: 'EDIT BACKEND',
       title: '改后端',
       body,
       okLabel: '保存并重启',
       onOk: async () => {
-        const svc = $('#f-svc').value.trim();
-        if (!svc) { $('#f-svc-err').textContent = '后端地址不能为空'; return false; }
+        const svc = svcInput.value.trim();
+        const errBox = $('#f-svc-err', body);
+        if (!svc) { errBox.textContent = '后端地址不能为空'; return false; }
+        if (!/^(https?):\/\/[A-Za-z0-9.\-\[\]:]+:\d{1,5}(\/.*)?$/.test(
+          svc.includes('://') ? svc : `http://${svc}`
+        )) { errBox.textContent = '写法：http://127.0.0.1:8080 或 https://192.168.8.1:443'; return false; }
         $('#modal').hidden = true;
-        await runJob({ op: 'update', hostname: host, service: svc });
+        await runJob({
+          op: 'update', hostname: host, service: svc, no_tls_verify: !!tlsBox.checked,
+        });
         return false;
       },
     });

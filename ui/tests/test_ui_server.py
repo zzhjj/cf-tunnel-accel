@@ -21,6 +21,9 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
 
+# 用仓库里的那份 cf-tunnel-accel 做解析，测试不受 /root/bin 已安装版本影响
+REPO_ACCEL = mod.load_accel(HERE.parent.parent.parent / "cf-tunnel-accel")
+
 
 class FakeAccel:
     """够用的 cf-tunnel-accel 替身：只实现控制台会用到的入口。"""
@@ -52,15 +55,11 @@ class FakeAccel:
         return self.config
 
     def parse_ingress_hostnames(self, text):
-        items, cur = [], None
-        for line in text.splitlines():
-            s = line.strip()
-            if s.startswith("- hostname:"):
-                cur = s.split(":", 1)[1].strip()
-            elif s.startswith("service:") and cur:
-                items.append((cur, s.split(":", 1)[1].strip()))
-                cur = None
-        return items
+        return [(e["hostname"], e["service"]) for e in self.parse_ingress_entries(text)]
+
+    def parse_ingress_entries(self, text):
+        # 用真实模块的解析器，保证替身和实现不会漂移
+        return REPO_ACCEL.parse_ingress_entries(text)
 
     def ensure_zone_cache(self):
         return None
@@ -81,7 +80,7 @@ class FakeAccel:
     def get_dns_record_content(self, zone_id, name, rtype="CNAME"):
         return "cdn.example.org"
 
-    def probe_local_backend(self, service, timeout=5, host_header=None):
+    def probe_local_backend(self, service, timeout=5, host_header=None, no_tls_verify=None):
         return True, "HTTP 200 (HEAD)"
 
     def verify_https(self, host, timeout=25):
@@ -91,10 +90,10 @@ class FakeAccel:
         pass
 
     # ---- 写入 ----
-    def add_accelerated_service(self, host, service, external=False):
-        self.calls.append(("add", host, service, external))
+    def add_accelerated_service(self, host, service, external=False, no_tls_verify=None):
+        self.calls.append(("add", host, service, external, no_tls_verify))
 
-    def upsert_tunnel_hostname(self, host, service):
+    def upsert_tunnel_hostname(self, host, service, no_tls_verify=None):
         self.calls.append(("upsert", host, service))
         return True
 
@@ -262,7 +261,9 @@ class JobTest(unittest.TestCase):
         job = self.runner.submit("add", {"hostname": "b.example.org", "service": "http://127.0.0.1:9"}, "test")
         self._wait(job)
         self.assertEqual(job.status, "done", job.error)
-        self.assertIn(("add", "b.example.org", "http://127.0.0.1:9", False), self.accel.calls)
+        self.assertIn(
+            ("add", "b.example.org", "http://127.0.0.1:9", False, False), self.accel.calls
+        )
 
         job2 = self.runner.submit(
             "update", {"hostname": "a.example.org", "service": "http://127.0.0.1:9090"}, "test"
@@ -284,7 +285,9 @@ class JobTest(unittest.TestCase):
         def noisy(msg="", color=None):
             self.accel.cprint(msg, color)
 
-        self.accel.upsert_tunnel_hostname = lambda h, s: (noisy("改了 ingress"), True)[1]
+        self.accel.upsert_tunnel_hostname = (
+            lambda h, s, nv=None: (noisy("改了 ingress"), True)[1]
+        )
         job = self.runner.submit(
             "update", {"hostname": "a.example.org", "service": "http://127.0.0.1:8080"}, "test"
         )
@@ -387,6 +390,84 @@ class StateShapeTest(unittest.TestCase):
         self.assertEqual(host["saas"]["status"], "active")
         self.assertTrue(host["probe"]["ok"])
         self.assertTrue(host["https"]["ok"])
+
+
+class HttpsOriginTest(unittest.TestCase):
+    """https 源站（自签证书）在隧道里必须带 originRequest.noTLSVerify。"""
+
+    def test_wants_no_tls_verify_defaults(self):
+        accel = FakeAccel()
+        real = REPO_ACCEL
+        self.assertTrue(real.wants_no_tls_verify("https://192.168.8.1:443"))
+        self.assertFalse(real.wants_no_tls_verify("http://127.0.0.1:8080"))
+        self.assertFalse(real.wants_no_tls_verify("https://192.168.8.1:443", explicit=False))
+        self.assertFalse(real.wants_no_tls_verify("http://127.0.0.1:80", explicit=True))
+        void = accel  # 保持测试不依赖网络
+        self.assertIsNotNone(void)
+
+    def test_upsert_writes_and_strips_origin_request(self):
+        real = REPO_ACCEL
+        cfg = Path(tempfile.mkdtemp()) / "config.yml"
+        cfg.write_text(
+            "tunnel: t\ningress:\n"
+            "  - hostname: a.example.org\n"
+            "    service: http://127.0.0.1:80\n"
+            "  - service: http_status:404\n",
+            encoding="utf-8",
+        )
+        original = real.CONFIG_PATH
+        real.CONFIG_PATH = cfg
+        try:
+            self.assertTrue(
+                real.upsert_tunnel_hostname("a.example.org", "https://192.168.8.1:443")
+            )
+            text = cfg.read_text(encoding="utf-8")
+            self.assertIn("service: https://192.168.8.1:443", text)
+            self.assertIn("originRequest:", text)
+            self.assertIn("noTLSVerify: true", text)
+            entries = {e["hostname"]: e for e in real.parse_ingress_entries(text)}
+            self.assertTrue(entries["a.example.org"]["no_tls_verify"])
+
+            # 改回 http 时必须把 originRequest 删干净，不留死配置
+            self.assertTrue(
+                real.upsert_tunnel_hostname("a.example.org", "http://127.0.0.1:80")
+            )
+            text = cfg.read_text(encoding="utf-8")
+            self.assertNotIn("noTLSVerify", text)
+            self.assertNotIn("originRequest", text)
+            entries = {e["hostname"]: e for e in real.parse_ingress_entries(text)}
+            self.assertFalse(entries["a.example.org"]["no_tls_verify"])
+            # catch-all 必须还在
+            self.assertIn("http_status:404", text)
+        finally:
+            real.CONFIG_PATH = original
+
+    def test_build_host_flags_missing_origin_skip(self):
+        accel = FakeAccel()
+        accel.config = (
+            "tunnel: t\n"
+            "ingress:\n"
+            "  - hostname: a.example.org\n"
+            "    service: https://192.168.8.1:443\n"
+            "  - service: http_status:404\n"
+        )
+        host = mod.build_host(accel, "a.example.org")
+        self.assertFalse(host["no_tls_verify"])
+        self.assertFalse(host["probe"]["ok"])          # 缺 noTLSVerify → 视为不可用
+        self.assertIn("noTLSVerify", host["probe"]["detail"])
+
+        accel.config = (
+            "tunnel: t\n"
+            "ingress:\n"
+            "  - hostname: a.example.org\n"
+            "    service: https://192.168.8.1:443\n"
+            "    originRequest:\n"
+            "      noTLSVerify: true\n"
+            "  - service: http_status:404\n"
+        )
+        host = mod.build_host(accel, "a.example.org")
+        self.assertTrue(host["no_tls_verify"])
+        self.assertTrue(host["probe"]["ok"])
 
 
 class SessionTest(unittest.TestCase):

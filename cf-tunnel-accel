@@ -33,6 +33,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import statistics
 import subprocess
 import sys
@@ -1503,6 +1504,31 @@ def parse_ingress_hostnames(text: str) -> List[Tuple[str, str]]:
     return items
 
 
+def parse_ingress_entries(text: str) -> List[dict]:
+    """解析 ingress，含 originRequest.noTLSVerify；不含 catch-all。"""
+    lines = text.splitlines()
+    out: List[dict] = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^  - hostname:\s*(\S+)(?:\s+#.*)?\s*$", lines[i])
+        if m:
+            entry = {"hostname": m.group(1), "service": "", "no_tls_verify": False}
+            j = i + 1
+            while j < len(lines):
+                line = lines[j]
+                if re.match(r"^  - (?:hostname|service):", line):
+                    break
+                m2 = re.match(r"^    service:\s*(\S+)(?:\s+#.*)?\s*$", line)
+                if m2 and not entry["service"]:
+                    entry["service"] = m2.group(1)
+                if re.match(r"^      noTLSVerify:\s*true\s*$", line):
+                    entry["no_tls_verify"] = True
+                j += 1
+            out.append(entry)
+        i += 1
+    return out
+
+
 def _has_ingress_hostname(lines: List[str], hostname: str) -> bool:
     pattern = re.compile(rf"^  - hostname:\s*{re.escape(hostname)}\s*(?:#.*)?$")
     return any(pattern.match(line) for line in lines)
@@ -1559,8 +1585,57 @@ def _ensure_grace_period(lines: List[str]) -> bool:
     return True
 
 
-def upsert_tunnel_hostname(hostname: str, service_url: str) -> bool:
-    """新增/更新 ingress；返回是否真的修改了配置。"""
+def wants_no_tls_verify(service_url: str, explicit: Optional[bool] = None) -> bool:
+    """https 源站默认跳过证书校验。
+
+    局域网里的 https 后端（路由器/NAS/自建面板）几乎都是自签证书，证书里通常
+    没有 IP SAN。cloudflared 默认校验源站证书，于是直接 502：
+        tls: failed to verify certificate: x509: cannot validate certificate
+        for 192.168.8.1 because it doesn't contain any IP SANs
+    所以 https 源站默认写 originRequest.noTLSVerify=true；显式传 False 可以关掉。
+    """
+    if explicit is not None:
+        return bool(explicit) and service_url.startswith("https://")
+    return service_url.startswith("https://")
+
+
+def ingress_origin_block(no_tls_verify: bool) -> List[str]:
+    return ["    originRequest:", "      noTLSVerify: true"] if no_tls_verify else []
+
+
+def _strip_origin_request(lines: List[str], idx: int) -> Tuple[List[str], bool]:
+    """删除某个 hostname 项里的 originRequest 块，返回 (新行, 是否有改动)。"""
+    out = list(lines)
+    changed = False
+    j = idx + 1
+    while j < len(out):
+        line = out[j]
+        if re.match(r"^  - (?:hostname|service):", line) or (
+            line.strip() and not line.startswith("    ")
+        ):
+            break
+        if re.match(r"^    originRequest:\s*$", line):
+            del out[j]
+            changed = True
+            # 连带删掉它下面的子项（缩进 6 空格）
+            while j < len(out) and re.match(r"^      \S", out[j]):
+                del out[j]
+            continue
+        if re.match(r"^    noTLSVerify:", line):
+            del out[j]
+            changed = True
+            continue
+        j += 1
+    return out, changed
+
+
+def upsert_tunnel_hostname(
+    hostname: str, service_url: str, no_tls_verify: Optional[bool] = None
+) -> bool:
+    """新增/更新 ingress；返回是否真的修改了配置。
+
+    https 源站会自动补 originRequest.noTLSVerify（见 wants_no_tls_verify）。
+    """
     if not CONFIG_PATH.exists():
         raise CFError(
             f"找不到隧道配置: {CONFIG_PATH}\n"
@@ -1575,6 +1650,7 @@ def upsert_tunnel_hostname(hostname: str, service_url: str) -> bool:
 
     host_line = f"  - hostname: {hostname}"
     service_line = f"    service: {service_url}"
+    no_verify = wants_no_tls_verify(service_url, no_tls_verify)
 
     lines = text.splitlines()
     changed = False
@@ -1598,6 +1674,17 @@ def upsert_tunnel_hostname(hostname: str, service_url: str) -> bool:
                     changed = True
             else:
                 lines.insert(idx + 1, service_line)
+                service_idx = idx + 1
+                changed = True
+            lines, origin_changed = _strip_origin_request(lines, idx)
+            changed = changed or origin_changed
+            if no_verify:
+                # 重新定位 service 行（上面的删除可能让下标变了）
+                pos = idx + 1
+                while pos < len(lines) and not re.match(r"^    service:\s*", lines[pos]):
+                    pos += 1
+                block = ingress_origin_block(True)
+                lines[pos + 1:pos + 1] = block
                 changed = True
             break
     else:
@@ -1607,10 +1694,11 @@ def upsert_tunnel_hostname(hostname: str, service_url: str) -> bool:
             if re.match(r"^  - service:\s*", line) and "hostname:" not in line:
                 insert_at = idx
                 break
+        block = [host_line, service_line] + ingress_origin_block(no_verify)
         if insert_at is None:
-            lines.extend([host_line, service_line])
+            lines.extend(block)
         else:
-            lines[insert_at:insert_at] = [host_line, service_line, ""]
+            lines[insert_at:insert_at] = block + [""]
         changed = True
 
     if _ensure_fallback_ingress(lines):
@@ -1829,8 +1917,63 @@ def wait_dns_cname(zone_id: str, name: str, expect: str, timeout: int = 90) -> s
     raise CFError(f"等待 DNS CNAME 生效超时: {name} 当前={last or '(空)'} 期望={expect}")
 
 
+def _unverified_ssl_context() -> "ssl.SSLContext":
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def origin_cert_info(service_url: str, timeout: int = 5) -> Optional[dict]:
+    """读取源站证书的 subject/issuer/有效期；拿不到就返回 None。"""
+    parsed = urllib.parse.urlparse(
+        service_url if "://" in service_url else f"http://{service_url}"
+    )
+    if (parsed.scheme or "http") != "https":
+        return None
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 443
+    try:
+        ctx = _unverified_ssl_context()
+        with socket.create_connection((host, int(port)), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                cert = tls.getpeercert()
+    except Exception:  # noqa: BLE001
+        return None
+    if not cert:
+        return None
+
+    def _name(parts) -> str:
+        flat = []
+        for rdn in parts or ():
+            for k, v in rdn:
+                if k in ("commonName", "organizationName"):
+                    flat.append(v)
+        return " / ".join(flat) or "-"
+
+    return {
+        "subject": _name(cert.get("subject")),
+        "issuer": _name(cert.get("issuer")),
+        "not_after": cert.get("notAfter", "-"),
+        "san": [v for k, v in (cert.get("subjectAltName") or []) if k == "DNS"],
+    }
+
+
+def self_signed_hint(service_url: str) -> Optional[str]:
+    """https 源站如果是自签/缺 IP SAN，给出人话解释。"""
+    info = origin_cert_info(service_url)
+    if not info:
+        return None
+    if info["subject"] and info["subject"] == info["issuer"]:
+        return f"源站证书自签（{info['subject']}），有效期至 {info['not_after']}"
+    return None
+
+
 def probe_local_backend(
-    service_url: str, timeout: int = 5, host_header: Optional[str] = None
+    service_url: str,
+    timeout: int = 5,
+    host_header: Optional[str] = None,
+    no_tls_verify: Optional[bool] = None,
 ) -> Tuple[bool, str]:
     """探测本地后端，返回 (是否可用, 简短原因)。
 
@@ -1846,28 +1989,43 @@ def probe_local_backend(
     if host_header:
         headers["Host"] = host_header
 
+    is_https = url.startswith("https://")
+    # 自签证书的源站（路由器、NAS 管理页）在局域网里很常见。这里先用默认校验
+    # 探测，证书过不了就换成不校验重试，并在结果里明说，不假装后端挂了。
+    unverified = bool(no_tls_verify) or (is_https and no_tls_verify is None)
+    cert_note = ""
+
     for method in ("HEAD", "GET"):
-        try:
-            req = urllib.request.Request(
-                url,
-                method=method,
-                headers=headers,
-            )
+        for attempt in (("verify",) if (is_https and not unverified) else ("noverify",)) + (
+            ("noverify",) if (is_https and not unverified) else ()
+        ):
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    code = getattr(resp, "status", None) or resp.getcode()
-            except urllib.error.HTTPError as exc:
-                # 401/403/404/405/5xx 仍然说明后端在线。
-                code = exc.code
-            note = f"HTTP {code} ({method})"
-            if int(code) >= 400:
-                note += "（业务状态码已忽略）"
-            # 很多 API 不实现 HEAD；用 GET 复核，避免把 405/501 误判成异常。
-            if method == "HEAD" and int(code) in (405, 501):
-                continue
-            return True, note
-        except Exception as exc:
-            last_err = str(exc)
+                req = urllib.request.Request(
+                    url,
+                    method=method,
+                    headers=headers,
+                )
+                try:
+                    ctx = _unverified_ssl_context() if attempt == "noverify" else None
+                    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                        code = getattr(resp, "status", None) or resp.getcode()
+                except urllib.error.HTTPError as exc:
+                    # 401/403/404/405/5xx 仍然说明后端在线。
+                    code = exc.code
+                if attempt == "noverify" and is_https:
+                    cert_note = "（源站证书未校验）"
+                note = f"HTTP {code} ({method}){cert_note}"
+                if int(code) >= 400:
+                    note += "（业务状态码已忽略）"
+                # 很多 API 不实现 HEAD；用 GET 复核，避免把 405/501 误判成异常。
+                if method == "HEAD" and int(code) in (405, 501):
+                    continue
+                return True, note
+            except ssl.SSLCertVerificationError as exc:
+                last_err = f"证书校验失败: {exc.verify_message or exc}"
+                continue  # 换 noverify 再试
+            except Exception as exc:
+                last_err = str(exc)
 
     try:
         parsed = urllib.parse.urlparse(
@@ -1883,10 +2041,15 @@ def probe_local_backend(
 
 
 def check_local_backend(
-    service_url: str, timeout: int = 5, host_header: Optional[str] = None
+    service_url: str,
+    timeout: int = 5,
+    host_header: Optional[str] = None,
+    no_tls_verify: Optional[bool] = None,
 ) -> None:
     """配置前检查本地后端，避免隧道建好但业务 502。"""
-    ok, detail = probe_local_backend(service_url, timeout=timeout, host_header=host_header)
+    ok, detail = probe_local_backend(
+        service_url, timeout=timeout, host_header=host_header, no_tls_verify=no_tls_verify
+    )
     if ok:
         cprint(f"本地后端探活: {service_url} -> {detail}", "green")
         return
@@ -2390,7 +2553,10 @@ def normalize_service(raw: str) -> str:
 # =========================
 
 def add_accelerated_service(
-    hostname: str, service_url: str, external: bool = False
+    hostname: str,
+    service_url: str,
+    external: bool = False,
+    no_tls_verify: Optional[bool] = None,
 ) -> None:
     cprint("\n====== 开始自动配置 ======", "bold")
     cprint(f"域名: {hostname}", "cyan")
@@ -2417,7 +2583,14 @@ def add_accelerated_service(
         raise CFError(config_missing_hint())
 
     # 0) 本地后端探活，避免“隧道配置成功但访问 502”
-    check_local_backend(service_url, host_header=hostname)
+    check_local_backend(service_url, host_header=hostname, no_tls_verify=no_tls_verify)
+    if wants_no_tls_verify(service_url, no_tls_verify):
+        hint = self_signed_hint(service_url)
+        cprint(
+            "源站是 https：将写入 originRequest.noTLSVerify=true"
+            + (f"（{hint}）" if hint else ""),
+            "yellow",
+        )
 
     # 1) 基础入口
     ensure_origin_dns()
@@ -2428,7 +2601,7 @@ def add_accelerated_service(
     # 2) tunnel：配置变更才重启；校验/重启失败自动恢复调用前版本。
     config_before = read_config_text()
     try:
-        config_changed = upsert_tunnel_hostname(hostname, service_url)
+        config_changed = upsert_tunnel_hostname(hostname, service_url, no_tls_verify)
         # 确保 origin 在 ingress 中，而不是只在注释或其它字段中出现。
         cfg_lines = read_config_text().splitlines()
         if not _has_ingress_hostname(cfg_lines, FALLBACK_ORIGIN):
@@ -2588,9 +2761,11 @@ def list_all() -> None:
         cprint("  （本机没有可读的隧道配置）", "yellow")
         for line in config_missing_hint().splitlines():
             cprint(f"  {line}", "yellow")
-    for host, service in routes:
+    for entry in parse_ingress_entries(text):
+        host, service = entry["hostname"], entry["service"]
         mark = " [系统回退源]" if host == FALLBACK_ORIGIN else ""
-        cprint(f"  {host:30s} -> {service}{mark}")
+        insecure = " [noTLSVerify]" if entry.get("no_tls_verify") else ""
+        cprint(f"  {host:30s} -> {service}{insecure}{mark}")
 
     cprint("\n====== SaaS 自定义主机名 ======", "bold")
     for item in list_custom_hostnames():
@@ -2767,10 +2942,10 @@ def health_check(hostname: Optional[str] = None, include_https: bool = False) ->
         return False
 
     text = CONFIG_PATH.read_text(encoding="utf-8")
-    routes = parse_ingress_hostnames(text)
+    entries = parse_ingress_entries(text)
     if hostname:
-        routes = [(h, s) for h, s in routes if h == hostname]
-        if not routes:
+        entries = [e for e in entries if e["hostname"] == hostname]
+        if not entries:
             cprint(f"FAIL 配置中找不到 hostname: {hostname}", "red")
             return False
 
@@ -2820,7 +2995,10 @@ def health_check(hostname: Optional[str] = None, include_https: bool = False) ->
         # 无法读取 SaaS 状态时不能把整条链路误报为健康。
         failures += 1
 
-    for host, service in routes:
+    for entry in entries:
+        host = entry["hostname"]
+        service = entry["service"]
+        no_verify = entry.get("no_tls_verify")
         if service.startswith("http_status:"):
             cprint(f"PASS {host} -> {service}（catch-all/内置响应）", "green")
             continue
@@ -2833,7 +3011,13 @@ def health_check(hostname: Optional[str] = None, include_https: bool = False) ->
                 "cyan",
             )
             continue
-        ok, detail = probe_local_backend(service, timeout=3, host_header=host)
+        ok, detail = probe_local_backend(
+            service, timeout=3, host_header=host, no_tls_verify=no_verify
+        )
+        if service.startswith("https://") and not no_verify:
+            # https 源站没开 noTLSVerify，cloudflared 会因为源站证书校验失败而 502
+            detail += "；缺 originRequest.noTLSVerify，经隧道访问会 502"
+            ok = False
         http_code = backend_status_code(detail)
         gateway_error = http_code is not None and 500 <= http_code <= 599
         service_ok = ok and not gateway_error
@@ -3228,9 +3412,20 @@ def _main_locked(argv: List[str]) -> int:
             if cmd == "add":
                 add_args = [a for a in argv[2:]]
                 external = "--external" in add_args
-                add_args = [a for a in add_args if a != "--external"]
+                no_verify_flag: Optional[bool] = None
+                if "--no-verify" in add_args or "--insecure" in add_args:
+                    no_verify_flag = True
+                if "--verify" in add_args:
+                    no_verify_flag = False
+                add_args = [
+                    a
+                    for a in add_args
+                    if a not in ("--external", "--no-verify", "--insecure", "--verify")
+                ]
                 if len(add_args) > 2:
-                    raise CFError("add 用法: add [域名或zone] [ip:port] [--external]")
+                    raise CFError(
+                        "add 用法: add [域名或zone] [ip:port] [--external] [--no-verify|--verify]"
+                    )
                 if not add_args:
                     hostname = choose_hostname_interactive()
                     if not hostname:
@@ -3278,7 +3473,9 @@ def _main_locked(argv: List[str]) -> int:
                         "cyan",
                     )
                     service = normalize_service(prompt("本地服务 ip:port", "127.0.0.1:8080"))
-                add_accelerated_service(hostname, service, external=external)
+                add_accelerated_service(
+                    hostname, service, external=external, no_tls_verify=no_verify_flag
+                )
                 return 0
             if cmd == "list":
                 list_all()
