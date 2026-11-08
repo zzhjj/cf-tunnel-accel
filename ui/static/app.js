@@ -298,7 +298,7 @@
     if (card) {
       document.getElementById('routes').scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
       card.animate?.(
-        [{ boxShadow: 'inset 0 0 0 1px rgba(200,255,60,.9)' }, { boxShadow: 'inset 0 0 0 1px rgba(200,255,60,0)' }],
+        [{ boxShadow: 'inset 0 0 0 1px rgba(225,59,12,.9)' }, { boxShadow: 'inset 0 0 0 1px rgba(225,59,12,0)' }],
         { duration: 1400, easing: 'cubic-bezier(.16,1,.3,1)' },
       );
     }
@@ -840,9 +840,12 @@
 
     function resize() {
       if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      W = Math.max(320, rect.width);
-      H = Math.max(240, rect.height);
+      // 量父容器而不是 canvas 自己：canvas 的 width/height 属性会反过来影响
+      // 自身布局尺寸，直接用 getBoundingClientRect 会形成正反馈，越量越大。
+      const box = canvas.parentElement || canvas;
+      const rect = box.getBoundingClientRect();
+      W = Math.max(280, rect.width);
+      H = Math.max(200, rect.height);
       dpr = Math.min(2, window.devicePixelRatio || 1);
       canvas.width = Math.round(W * dpr);
       canvas.height = Math.round(H * dpr);
@@ -892,7 +895,8 @@
         if (!seen.has(port)) seen.set(port, []);
         seen.get(port).push(r.hostname);
       });
-      const ports = Array.from(seen.keys()).slice(0, 12);
+      // 窄屏塞不下 12 个后端节点，标签会互相压住；只画前 7 个
+      const ports = Array.from(seen.keys()).slice(0, W < 560 ? 7 : 12);
       ports.forEach((port, i) => {
         const y = H * 0.14 + (H * 0.72) * (ports.length === 1 ? 0.5 : i / (ports.length - 1));
         const svc = S.services.find((s) => String(s.port) === String(port));
@@ -904,12 +908,12 @@
 
       // 域名点：以 ENTRY 为圆心的一圈扇形
       const routes = d.routes || [];
-      const baseR = Math.max(42, Math.min(96, W * 0.085));
+      const baseR = Math.max(38, Math.min(92, W * 0.082));
       routes.forEach((r, i) => {
         const k = routes.length === 1 ? 0.5 : i / (routes.length - 1);
-        // 扇形放在 ENTRY 左侧，避免压住节点标签
-        const ang = Math.PI * 0.52 + k * Math.PI * 0.96;
-        const rr = baseR + (i % 3) * 9;
+        // 扇形放在 ENTRY 左侧；半径按序号做细密波纹，避免挤成一坨
+        const ang = Math.PI * 0.58 + k * Math.PI * 0.84;
+        const rr = baseR + (i % 4) * 7.5;
         const dot = {
           host: r.hostname,
           service: r.service,
@@ -941,16 +945,16 @@
         const isTarget = S.target === dot.host;
         const isHover = hoverDot === dot;
         const alpha = isTarget || isHover ? 0.85 : 0.2;
-        ctx.strokeStyle = `rgba(236,231,219,${alpha * 0.34})`;
+        ctx.strokeStyle = `rgba(23,19,14,${alpha * 0.34})`;
         ctx.lineWidth = 0.6;
         ctx.beginPath();
         ctx.moveTo(entry.x, entry.y);
         ctx.lineTo(dot.x, dot.y);
         ctx.stroke();
-        const col = isTarget || isHover ? '200,255,60'
-          : dot.saas && dot.saas.ssl && dot.saas.ssl !== 'active' ? '255,182,56'
-          : '236,231,219';
-        ctx.fillStyle = `rgba(${col},${isTarget || isHover ? 1 : 0.5})`;
+        const col = isTarget || isHover ? '225,59,12'
+          : dot.saas && dot.saas.ssl && dot.saas.ssl !== 'active' ? '143,86,0'
+          : '23,19,14';
+        ctx.fillStyle = `rgba(${col},${isTarget || isHover ? 1 : 0.55})`;
         ctx.beginPath();
         ctx.arc(dot.x, dot.y, isTarget || isHover ? dot.r + 1.2 : dot.r, 0, Math.PI * 2);
         ctx.fill();
@@ -960,7 +964,7 @@
       edges.forEach((e, ei) => {
         if (!e.a || !e.b) return;
         const a = e.a, b = e.b;
-        ctx.strokeStyle = 'rgba(236,231,219,0.13)';
+        ctx.strokeStyle = 'rgba(23,19,14,0.13)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
@@ -975,7 +979,7 @@
           const x = bez(a.x, mx, mx, b.x, p);
           const y = bez(a.y, a.y, b.y, b.y, p);
           const fade = Math.sin(p * Math.PI);
-          ctx.fillStyle = `rgba(200,255,60,${0.16 + fade * 0.5})`;
+          ctx.fillStyle = `rgba(225,59,12,${0.16 + fade * 0.5})`;
           ctx.beginPath();
           ctx.arc(x, y, 1.5 + fade * 1.1, 0, Math.PI * 2);
           ctx.fill();
@@ -988,22 +992,22 @@
         const oy = n.y + py * (n.kind === 'entry' ? 10 : 6);
         const entryKind = n.kind === 'entry';
         const down = n.kind === 'svc-down';
-        ctx.strokeStyle = entryKind ? 'rgba(200,255,60,0.85)'
-          : down ? 'rgba(255,75,43,0.7)'
-          : 'rgba(236,231,219,0.45)';
+        ctx.strokeStyle = entryKind ? 'rgba(225,59,12,0.85)'
+          : down ? 'rgba(179,45,6,0.7)'
+          : 'rgba(23,19,14,0.45)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.arc(ox, oy, n.r + 3, 0, Math.PI * 2);
         ctx.stroke();
 
-        ctx.fillStyle = entryKind ? '#c8ff3c' : down ? '#ff4b2b' : 'rgba(236,231,219,0.8)';
+        ctx.fillStyle = entryKind ? '#e13b0c' : down ? '#ff4b2b' : 'rgba(23,19,14,0.8)';
         ctx.beginPath();
         ctx.arc(ox, oy, n.r * 0.62, 0, Math.PI * 2);
         ctx.fill();
 
         if (entryKind && !reduceMotion) {
           const pulse = (Math.sin(t * 2) + 1) / 2;
-          ctx.strokeStyle = `rgba(200,255,60,${0.28 * (1 - pulse)})`;
+          ctx.strokeStyle = `rgba(225,59,12,${0.28 * (1 - pulse)})`;
           ctx.beginPath();
           ctx.arc(ox, oy, n.r + 3 + pulse * 16, 0, Math.PI * 2);
           ctx.stroke();
@@ -1011,39 +1015,43 @@
 
         // 标签
         ctx.textBaseline = 'middle';
-        ctx.font = '600 9px "Noto Sans Mono", ui-monospace, monospace';
-        ctx.fillStyle = entryKind ? 'rgba(200,255,60,.95)' : 'rgba(236,231,219,.72)';
-        const labelRight = n.kind === 'svc' || n.kind === 'svc-down';
-        const lx = labelRight ? ox + 10 : ox;
-        const ly = labelRight ? oy : oy - n.r - 15;
-        ctx.textAlign = labelRight ? 'left' : 'center';
+        ctx.font = '600 9px "JetBrains Mono", ui-monospace, monospace';
+        ctx.fillStyle = entryKind ? 'rgba(225,59,12,.95)' : 'rgba(23,19,14,.72)';
+        // 窄屏时后端节点靠右，标签改放左侧，避免被图版边缘切掉
+        const portNode = n.kind === 'svc' || n.kind === 'svc-down';
+        const labelRight = portNode ? W >= 560 : false;
+        const labelLeftSide = portNode && W < 560;
+        const lx = labelLeftSide ? ox - 12 : labelRight ? ox + 10 : ox;
+        const ly = portNode ? oy : oy - n.r - 15;
+        ctx.textAlign = labelLeftSide ? 'right' : labelRight ? 'left' : 'center';
         ctx.fillText(String(n.label).toUpperCase(), lx, ly);
         // 窄屏就别塞副标题了，主轴三个节点的字会互相压住
-        const showSub = !labelRight && (W >= 560 || entryKind);
-        if (n.sub && (showSub || labelRight)) {
-          ctx.font = '400 8px "Noto Sans Mono", ui-monospace, monospace';
-          ctx.fillStyle = 'rgba(236,231,219,.34)';
+        const showSub = !labelRight && W >= 620;
+        const portSubOk = portNode && W >= 560;   // 窄屏后端节点只留端口号
+        if (n.sub && ((showSub && !portNode) || portSubOk)) {
+          ctx.font = '400 8px "JetBrains Mono", ui-monospace, monospace';
+          ctx.fillStyle = 'rgba(23,19,14,.42)';
           const raw = String(n.sub);
           const limit = W >= 560 ? 28 : 18;
           const sub = raw.length > limit ? `${raw.slice(0, limit - 1)}…` : raw;
-          ctx.fillText(sub, labelRight ? lx : ox, labelRight ? ly + 11 : oy + n.r + 15);
+          ctx.fillText(sub, portNode ? lx : ox, portNode ? ly + 11 : oy + n.r + 15);
         }
       });
 
       // hover 提示
       if (hoverDot) {
         const pad = 6;
-        ctx.font = '500 9.5px "Noto Sans Mono", ui-monospace, monospace';
+        ctx.font = '500 9.5px "JetBrains Mono", ui-monospace, monospace';
         const text = hoverDot.host;
         const w = ctx.measureText(text).width + pad * 2;
         const hx = Math.min(W - w - 6, Math.max(6, hoverDot.x + 10));
         const hy = Math.min(H - 26, Math.max(6, hoverDot.y - 20));
-        ctx.fillStyle = 'rgba(8,9,11,.92)';
+        ctx.fillStyle = 'rgba(243,238,225,.97)';
         ctx.fillRect(hx, hy, w, 18);
-        ctx.strokeStyle = 'rgba(200,255,60,.5)';
+        ctx.strokeStyle = 'rgba(225,59,12,.5)';
         ctx.lineWidth = 1;
         ctx.strokeRect(hx + 0.5, hy + 0.5, w - 1, 17);
-        ctx.fillStyle = '#ece7db';
+        ctx.fillStyle = '#17130e';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
         ctx.fillText(text, hx + pad, hy + 9);
@@ -1127,7 +1135,7 @@
       raf = requestAnimationFrame(step);
     }
 
-    return { init, relayout: () => { layout(); } };
+    return { init, relayout: () => { resize(); } };
   })();
 
   /* ── 数据加载 ─────────────────────────────────────────── */

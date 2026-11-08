@@ -105,6 +105,42 @@ def load_or_create_token() -> Tuple[str, bool]:
     return token, True
 
 
+class TTLCache:
+    """极简 TTL 缓存。
+
+    控制台的 /api/state 会顺带读 zone 清单、自定义主机名、优选 CNAME，
+    每次都打一遍 API 要 2–4s，页面就有“半天不出数”的体感。这里按秒缓存，
+    写操作成功后由 JobRunner 主动失效。
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.data: Dict[str, Tuple[float, Any]] = {}
+
+    def get(self, key: str, ttl: float, factory, force: bool = False):
+        now = time.time()
+        if not force:
+            with self.lock:
+                hit = self.data.get(key)
+                if hit and hit[0] > now:
+                    return hit[1]
+        value = factory()
+        with self.lock:
+            self.data[key] = (now + ttl, value)
+        return value
+
+    def invalidate(self, *keys: str) -> None:
+        with self.lock:
+            if not keys:
+                self.data.clear()
+                return
+            for key in keys:
+                self.data.pop(key, None)
+
+
+CACHE = TTLCache()
+
+
 class Audit:
     """JSONL 审计，永不阻塞主流程。"""
 
@@ -384,17 +420,23 @@ def discover_services(accel, with_probe: bool = True) -> List[dict]:
     if with_probe and rows:
         targets = [r for r in rows if r["port"] > 0][:220]
 
-        def probe(row: dict) -> None:
-            host = (row["mapped"][0] if row["mapped"] else "localhost")
+        def probe_one(port: int, host: str) -> dict:
             try:
                 ok, detail = accel.probe_local_backend(
-                    f"http://127.0.0.1:{row['port']}", timeout=0.8, host_header=host
+                    f"http://127.0.0.1:{port}", timeout=0.7, host_header=host
                 )
             except Exception as exc:  # noqa: BLE001
                 ok, detail = False, str(exc)
-            row["probe"] = {"ok": bool(ok), "detail": detail}
+            return {"ok": bool(ok), "detail": detail}
 
-        with ThreadPoolExecutor(max_workers=32) as pool:
+        def probe(row: dict) -> None:
+            host = (row["mapped"][0] if row["mapped"] else "localhost")
+            # 探活结果按端口缓存：非 HTTP 端口每次都要等到超时，重复加载会很慢
+            row["probe"] = CACHE.get(
+                f"probe:{row['port']}:{host}", 12.0, lambda: probe_one(row["port"], host)
+            )
+
+        with ThreadPoolExecutor(max_workers=64) as pool:
             list(pool.map(probe, targets))
     return rows
 
@@ -527,6 +569,8 @@ class JobRunner:
             job.error = error
             job.ended = time.time()
             job.status = status
+            if status == "done":
+                CACHE.invalidate()  # 变更后立刻让下一次读取拿到新数据
 
     def _cdn_bench(self, job: Job) -> dict:
         """只测速，绝不改 DNS。"""
@@ -635,7 +679,11 @@ class JobRunner:
 # --------------------------------------------------------------------------
 # 状态聚合
 # --------------------------------------------------------------------------
-def build_state(accel) -> dict:
+def build_state(accel, force: bool = False) -> dict:
+    return CACHE.get("state", 5.0, lambda: _build_state(accel), force=force)
+
+
+def _build_state(accel) -> dict:
     accel.ensure_zone_cache()
     routes = accel.parse_ingress_hostnames(accel.read_config_text() or "")
     custom: Dict[str, dict] = {}
@@ -703,7 +751,11 @@ def build_state(accel) -> dict:
 CDN_HISTORY = CdnHistory(CDN_HISTORY_PATH)
 
 
-def build_cdn(accel) -> dict:
+def build_cdn(accel, force: bool = False) -> dict:
+    return CACHE.get("cdn", 10.0, lambda: _build_cdn(accel), force=force)
+
+
+def _build_cdn(accel) -> dict:
     """优选入口的当前目标与候选清单（只读，不发写请求）。"""
     try:
         current = accel.get_current_preferred_target(strict=False)
@@ -998,7 +1050,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(HTTPStatus.FORBIDDEN, "CSRF 校验失败")
 
         if method == "GET" and parts == ["state"]:
-            return self._json(200, {"ok": True, **build_state(accel)})
+            fresh = params.get("fresh", ["0"])[0] == "1"
+            return self._json(200, {"ok": True, **build_state(accel, force=fresh)})
         if method == "GET" and parts == ["services"]:
             probe = params.get("probe", ["1"])[0] != "0"
             return self._json(200, {"ok": True, "services": discover_services(accel, probe)})

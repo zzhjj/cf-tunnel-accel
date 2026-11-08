@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="ARC">
-  <rect width="64" height="64" fill="#08090b"/>
-  <g fill="none" stroke="#ece7db" stroke-width="4.2" stroke-linejoin="miter" stroke-linecap="square">
-    <path d="M8 52 L15 14 L22 52 M11 40 H19"/>
-    <path d="M26 52 V14 H33 A7 7 0 0 1 33 28 H26 M33 28 L40 52"/>
+  <rect width="64" height="64" fill="#f3eee1"/>
+  <g fill="none" stroke="#17130e" stroke-width="4" stroke-linejoin="miter" stroke-linecap="butt">
+    <path d="M7 53 L14 15 L21 53 M10 41 H18"/>
+    <path d="M25 53 V15 H32 A7 7 0 0 1 32 29 H25 M32 29 L39 53"/>
   </g>
-  <path d="M60 21 A13 13 0 1 0 60 45" fill="none" stroke="#c8ff3c" stroke-width="4.2" stroke-linecap="square"/>
+  <path d="M59 22 A13 13 0 1 0 59 44" fill="none" stroke="#e13b0c" stroke-width="4"/>
 </svg>

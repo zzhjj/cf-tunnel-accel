@@ -3,10 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
 <meta name="robots" content="noindex, nofollow, noarchive">
 <title>ARC — cf-tunnel-accel console</title>
 <link rel="icon" href="/mark.svg" type="image/svg+xml">
+<link rel="preload" href="/fonts/playfair-display-900.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/jetbrains-mono-400.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -21,11 +23,9 @@
   <div class="gate-grid" aria-hidden="true"></div>
   <div class="gate-inner">
     <div class="gate-head">
-      <svg class="mark" viewBox="0 0 440 214" role="img" aria-label="ARC">
-        <path class="mark-a" d="M10 200 L62 14 L114 200 M33 132 H91" />
-        <path class="mark-r" d="M150 200 V14 H196 A42 42 0 0 1 196 98 H150 M196 98 L252 200" />
-        <path class="mark-c" d="M398 32 A95 95 0 1 0 398 182" />
-      </svg>
+      <p class="gate-word" role="img" aria-label="ARC">
+        <span class="gw-a" aria-hidden="true">A</span><span class="gw-r" aria-hidden="true">R</span><span class="gw-c" aria-hidden="true">C</span>
+      </p>
       <p class="gate-kicker">CF-TUNNEL-ACCEL · ACCELERATION ROUTE CONSOLE</p>
     </div>
 
@@ -59,6 +59,9 @@
       <li><b>04</b><span>失败退避锁定 + 全量审计落盘</span></li>
       <li><b>05</b><span>CSP 同源白名单，禁内联脚本与框架嵌套</span></li>
     </ul>
+    <p class="gate-colophon">
+      PRINTED IN THE BROWSER · 单文件标准库 · 无外链 · 无构建步骤
+    </p>
   </div>
 </section>
 
@@ -66,12 +69,8 @@
 <main class="app" id="app" hidden>
   <header class="topbar">
     <a class="brand" href="#top" aria-label="回到顶部">
-      <svg viewBox="0 0 128 62" class="brand-mark" aria-hidden="true">
-        <path d="M3 58 L13 5 L23 58 M7 38 H19"/>
-        <path d="M38 58 V5 H49 A11 11 0 0 1 49 27 H38 M49 27 L60 58"/>
-        <path d="M112 12 A21 21 0 1 0 112 50"/>
-      </svg>
-      <span class="brand-text">ARC<em>console</em></span>
+      <span class="brand-word" aria-hidden="true">AR<i>C</i></span>
+      <span class="brand-text">console<em>cf-tunnel-accel</em></span>
     </a>
 
     <div class="ticker" id="ticker" aria-live="off">
@@ -101,7 +100,11 @@
       <!-- HERO -->
       <section class="hero" id="hero">
         <div class="hero-copy">
-          <p class="eyebrow reveal">ACCELERATION ROUTE CONSOLE <span class="dot" aria-hidden="true"></span> <span id="hero-version">v—</span></p>
+          <p class="eyebrow reveal">
+            <span>ISSUE 01</span><span class="dot" aria-hidden="true"></span>
+            <span>ACCELERATION ROUTE CONSOLE</span>
+            <span id="hero-version">v—</span>
+          </p>
           <h1 class="hero-title">
             <span class="line reveal"><span>SIGNAL</span></span>
             <span class="line reveal"><span>OVER</span></span>
@@ -123,6 +126,7 @@
         </div>
 
         <figure class="hero-canvas">
+          <span class="regmark" aria-hidden="true"></span>
           <canvas id="topology" aria-label="加速链路拓扑图"></canvas>
           <figcaption class="canvas-legend">
             <span><i class="lg lg-entry"></i>入口</span>

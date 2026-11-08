@@ -301,8 +301,12 @@ class CdnTest(unittest.TestCase):
         self.audit = mod.Audit(Path(self.tmp.name) / "audit.log")
         self.accel = FakeAccel()
         self.runner = mod.JobRunner(self.accel, self.audit)
+        # 历史文件必须隔离：否则测试目标会写进真实的 ui-cdn-history.json
+        self._history = mod.CDN_HISTORY
+        mod.CDN_HISTORY = mod.CdnHistory(Path(self.tmp.name) / "cdn-history.json")
 
     def tearDown(self):
+        mod.CDN_HISTORY = self._history
         self.tmp.cleanup()
 
     def _wait(self, job, timeout=5.0):
@@ -313,7 +317,7 @@ class CdnTest(unittest.TestCase):
         return job
 
     def test_build_cdn_lists_candidates_and_current(self):
-        cdn = mod.build_cdn(self.accel)
+        cdn = mod.build_cdn(self.accel)  # setUp 已把历史指向临时文件
         self.assertEqual(cdn["entry"], "cdn.example.org")
         self.assertEqual(cdn["target"], "slow.example")
         domains = [c["domain"] for c in cdn["candidates"]]
