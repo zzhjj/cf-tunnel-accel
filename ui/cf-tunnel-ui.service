@@ -1,0 +1,19 @@
+[Unit]
+Description=cf-tunnel-accel web console (ARC)
+Documentation=https://github.com/zzhjj/cf-tunnel-accel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 默认只监听回环；远程管理使用 SSH 转发或 TLS 反向代理，见 ui/README.md。
+# 非回环监听须显式加 --allow-remote-http，且仅对受信 TLS 代理开放。
+ExecStart=/usr/bin/python3 -u @UI_DIR@/server.py --host 127.0.0.1 --port 8642
+Restart=always
+RestartSec=3s
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

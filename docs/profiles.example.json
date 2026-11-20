@@ -1,0 +1,14 @@
+{
+  "profiles": [
+    {
+      "id": "alpha",
+      "name": "Alpha tunnel",
+      "env_file": "/etc/cf-tunnel-accel/alpha/env"
+    },
+    {
+      "id": "beta",
+      "name": "Beta tunnel",
+      "env_file": "/etc/cf-tunnel-accel/beta/env"
+    }
+  ]
+}

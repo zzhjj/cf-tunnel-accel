@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>隧道网络控制台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">跳到主内容</a>
+<div id="app" inert>
+  <header class="topbar">
+    <a class="brand" href="#routes">隧道控制台</a>
+    <div class="profile-control">
+      <label for="profile-select">配置</label>
+      <select id="profile-select" disabled><option value="">等待加载</option></select>
+      <button id="profile-retry" type="button" hidden>重试配置</button>
+    </div>
+    <div class="api-meta" aria-live="polite">
+      <span id="api-status" class="status pending">API 待连接</span>
+      <span id="updated-at">尚未更新</span>
+      <span id="stale-state" class="status pending">数据未同步</span>
+    </div>
+    <button id="logout" type="button">退出登录</button>
+  </header>
+  <p id="profile-status" class="profile-message" role="status">正在检查会话…</p>
+  <div class="layout">
+    <nav class="nav" aria-label="主导航">
+      <a href="#routes" aria-current="page">路由</a>
+      <a href="#services">本机服务</a>
+      <a href="#cdn">优选</a>
+      <a href="#diagnostics">诊断</a>
+      <a href="#activity">任务审计</a>
+      <a href="#environment">环境</a>
+    </nav>
+    <main id="main" tabindex="-1">
+      <aside id="task-banner" class="task-banner" hidden aria-live="polite">
+        <div><b id="task-title"></b><p id="task-status"></p></div>
+        <a id="task-open" href="#activity">查看任务日志</a>
+        <button id="task-reconnect" type="button" hidden>重新同步</button>
+      </aside>
+      <section id="routes" class="page" aria-labelledby="routes-title">
+        <header class="page-head"><div><h1 id="routes-title">路由</h1><p>管理业务域名与本机后端的映射。</p></div><div class="actions"><button id="routes-refresh" type="button">刷新路由</button><button id="route-add" class="primary" type="button" disabled>新增路由</button></div></header>
+        <div id="state-summary" class="summary-grid"></div>
+        <div class="card">
+          <div class="toolbar"><label for="routes-filter">搜索路由</label><input id="routes-filter" type="search" placeholder="域名、后端或 zone"><span id="route-count" class="muted"></span></div>
+          <div id="routes-notice" class="notice" role="status">等待配置加载</div>
+          <div id="route-grid" class="route-grid"></div>
+        </div>
+        <details class="card manual-help"><summary>外部域名：手动 DNS（仅 CLI）</summary><p>外部域名不属于当前账户的 zone。交互式 CLI 需要 stdin 等待 DNS 确认，控制台仅提供说明，不提交外部 DNS 任务。</p><ol><li>在终端加载与所选配置相同的环境，先执行 <code>cf-tunnel-accel env</code> 核对配置来源，再执行 <code>cf-tunnel-accel domains</code>。</li><li>运行 <code>cf-tunnel-accel add app.example.com http://127.0.0.1:8080 --external</code>。</li><li>按 CLI 输出在域名所属 DNS 平台手动添加 DCV 验证记录及 DNS-only CNAME；等待生效后回终端确认，完成 HTTPS 验收。</li><li>外部路由的 DNS 切换或删除同样需要在 DNS 平台手动处理；UI 不替代这些步骤。</li></ol><p>流程可能写入 Tunnel / SaaS，失败时查看实际状态与 CLI 回滚输出；多服务变更不是跨服务事务。</p></details>
+      </section>
+      <section id="services" class="page" hidden aria-labelledby="services-title">
+        <header class="page-head"><div><h1 id="services-title">本机服务</h1><p>监听端口、进程、域名映射与 HTTP 探测。</p></div><button id="services-refresh" type="button">刷新并探测</button></header>
+        <div class="card"><div class="toolbar"><label for="services-filter">搜索服务</label><input id="services-filter" type="search" placeholder="端口、进程或域名"><label for="services-scope">映射状态</label><select id="services-scope"><option value="all">全部</option><option value="mapped">已映射</option><option value="free">未映射</option></select></div><div id="services-notice" class="notice" role="status">等待配置加载</div><div id="listener-list" class="list"></div></div>
+      </section>
+      <section id="cdn" class="page" hidden aria-labelledby="cdn-title">
+        <header class="page-head"><div><h1 id="cdn-title">优选入口</h1><p>Cloudflare for SaaS 辅助域 + DNS-only CNAME 候选选择。</p></div><button id="cdn-refresh" type="button">刷新优选</button></header>
+        <div class="card"><div id="cdn-notice" class="notice" role="status">等待配置加载</div><div id="cdn-summary"></div><p class="muted">不改变 Cloudflare Anycast 路由或隧道协议，不保证各地区提速。网络测速与业务 Host/SNI 验证分别显示；自动切换须通过业务验证。</p><div class="actions"><button id="cdn-test" type="button" disabled>仅测速（不改 DNS）</button><button id="cdn-best" class="primary" type="button" disabled>测速并自动优选…</button></div></div>
+        <div class="card"><h2>候选线路</h2><div id="cdn-candidates" class="list"></div><form id="cdn-manual-form" class="toolbar"><label for="cdn-manual">手动目标域名</label><input id="cdn-manual" placeholder="edge.example.net" autocomplete="off" aria-describedby="cdn-manual-error"><button id="cdn-manual-go" type="submit" disabled>确认切换…</button><p id="cdn-manual-error" class="field-error" role="alert"></p></form></div>
+      </section>
+      <section id="diagnostics" class="page" hidden aria-labelledby="diagnostics-title">
+        <header class="page-head"><div><h1 id="diagnostics-title">诊断</h1><p>检查本机后端、隧道、DNS、SaaS 与 HTTPS 链路。</p></div></header>
+        <div class="card"><form id="health-form"><div class="toolbar"><label for="diag-host">域名（留空检查全部）</label><input id="diag-host" placeholder="app.example.com" aria-describedby="diag-error"><label class="checkbox" for="diag-https"><input id="diag-https" type="checkbox" checked>包含 HTTPS 检查</label><button id="diag-run" class="primary" type="submit" disabled>开始检查</button></div><p id="diag-error" class="field-error" role="alert"></p></form><p>检查是后台任务，不展示估算百分比。执行结束与检查通过是不同状态；具体结果及完整日志见任务审计。</p><div id="diag-result" class="notice">尚未执行检查</div></div>
+      </section>
+      <section id="activity" class="page" hidden aria-labelledby="activity-title">
+        <header class="page-head"><div><h1 id="activity-title">任务审计</h1><p>全局任务与审计记录，归属不随当前配置改变。</p></div><button id="activity-refresh" type="button">刷新任务与审计</button></header>
+        <div class="card"><h2>后台任务</h2><div id="jobs-notice" class="notice" role="status">正在读取任务列表…</div><div id="job-list" class="list"></div></div>
+        <div class="card" id="job-detail"><h2>任务详情</h2><p id="job-detail-meta" class="muted">选择任务查看日志</p><div id="job-detail-notice" class="notice" role="status"></div><p id="log-omitted" class="muted" hidden></p><pre id="job-log" class="log" tabindex="0" aria-label="任务日志">尚未选择任务</pre><div id="job-result"></div></div>
+        <div class="card"><h2>操作审计</h2><div id="audit-notice" class="notice" role="status">正在读取审计…</div><div id="journal-list" class="list"></div></div>
+      </section>
+      <section id="environment" class="page" hidden aria-labelledby="environment-title">
+        <header class="page-head"><div><h1 id="environment-title">环境</h1><p>仅本地检查配置、依赖与凭据来源，不展示凭据内容。</p></div><button id="environment-refresh" type="button">重新检查环境</button></header>
+        <div class="card"><div id="environment-notice" class="notice" role="status">等待配置加载</div><div id="environment-content"></div></div>
+        <div class="card"><h2>恢复步骤</h2><ol><li>在相同配置环境执行 <code>cf-tunnel-accel env</code>，核对 account、Tunnel UUID、辅助域、config 与 service 的来源。</li><li>缺配置时执行 <code>cf-tunnel-accel init</code>，按提示创建自己的配置；依赖缺失按上方检查结果安装。</li><li>配置凭据并核对 API 权限后重新检查环境。凭据内容不应填入路由或任务日志。</li><li>无 systemd 时使用 CLI / UI 前台运行；不要将未启动的系统服务视为正常。</li></ol></div>
+      </section>
+      <footer>cf-tunnel-accel · 同源 API · 无构建依赖</footer>
+    </main>
+  </div>
+</div>
+<dialog id="gate" aria-labelledby="gate-title" aria-describedby="gate-help">
+  <form id="gate-form">
+    <h1 id="gate-title">登录控制台</h1><p id="gate-help">输入本机 UI 访问凭据。密码不保存到浏览器存储。</p>
+    <label for="token">访问凭据</label><input id="token" type="password" autocomplete="off" required aria-describedby="gate-msg" autofocus>
+    <p id="gate-msg" class="field-error" role="alert"></p>
+    <div class="actions"><button id="gate-retry" type="button">检查会话</button><button id="gate-submit" class="primary" type="submit">登录</button></div>
+  </form>
+</dialog>
+<dialog id="modal" aria-labelledby="modal-title">
+  <form id="modal-form" novalidate>
+    <h2 id="modal-title"></h2><p id="modal-profile" class="muted"></p><div id="modal-body"></div>
+    <p id="modal-error" class="field-error" role="alert"></p>
+    <div class="modal-foot"><button id="modal-cancel" type="button">取消</button><button id="modal-ok" class="primary" type="submit">确认</button></div>
+  </form>
+</dialog>
+<div id="messages" class="messages" role="status" aria-live="polite"></div>
+</body>
+</html>

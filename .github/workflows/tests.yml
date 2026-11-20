@@ -1,0 +1,75 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.9 只在还有该版本构建的镜像上跑；新镜像已不带 3.9。
+          - { os: ubuntu-22.04, python-version: '3.9' }
+          - { os: ubuntu-latest, python-version: '3.10' }
+          - { os: ubuntu-latest, python-version: '3.11' }
+          - { os: ubuntu-latest, python-version: '3.13' }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test runner (runtime uses only the standard library)
+        run: python -m pip install 'pytest>=8.3.5,<9'
+      - name: Isolate tests from installed configuration
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/cfa-tests"
+          echo "CF_TUNNEL_ACCEL_ENV_FILE=$RUNNER_TEMP/cfa-tests/absent.env" >> "$GITHUB_ENV"
+          echo "CF_TUNNEL_ACCEL_TOKEN_FILE=$RUNNER_TEMP/cfa-tests/absent-token" >> "$GITHUB_ENV"
+          echo "CF_TUNNEL_ACCEL_UI_DIR=$RUNNER_TEMP/cfa-tests/ui" >> "$GITHUB_ENV"
+          echo "CF_TUNNEL_ACCEL_SCRIPT=$GITHUB_WORKSPACE/cf-tunnel-accel" >> "$GITHUB_ENV"
+      - name: Python syntax
+        run: python -m py_compile cf-tunnel-accel cfa_*.py ui/*.py tests/*.py ui/tests/*.py
+      - name: Installer syntax
+        run: bash -n install.sh
+      - name: CLI offline tests
+        run: python -m pytest tests -q -W error
+      - name: UI offline tests
+        run: python -m pytest ui/tests -q -W error
+      - name: Standalone CLI unittest entry point
+        run: python tests/test_cf_tunnel_accel.py
+      - name: Whitespace check
+        run: git diff --check
+
+  browser-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Browser dependencies
+        run: |
+          python -m pip install 'playwright>=1.51,<2'
+          python -m playwright install --with-deps chromium
+      - name: JavaScript syntax
+        run: node --check ui/static/app.js
+      - name: Browser workflows and installed-package contract
+        env:
+          CF_TUNNEL_ACCEL_ENV_FILE: /tmp/cfa-ci-absent.env
+          CF_TUNNEL_ACCEL_TOKEN_FILE: /tmp/cfa-ci-absent-token
+          CF_TUNNEL_ACCEL_UI_DIR: /tmp/cfa-ci-ui
+          CF_TUNNEL_ACCEL_SCRIPT: ${{ github.workspace }}/cf-tunnel-accel
+        run: |
+          python ui/tests/ui_e2e.py
+          python tests/e2e_product.py

@@ -1,0 +1,17 @@
+# 运行时/本地状态，绝不入库
+*.bak.*
+*.bak
+zones.json
+token
+env
+*.env
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+# 隧道凭据 / 证书
+*.json.tmp
+credentials*.json
+*.pem
+*.key
+.DS_Store
