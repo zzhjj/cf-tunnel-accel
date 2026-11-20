@@ -1,6 +1,6 @@
 # 贡献指南
 
-先读 [README](README.md)、[部署与 profile 契约](docs/DEPLOYMENT.md)、[UI 说明](ui/README.md) 和[维护验收规范](docs/MAINTENANCE-SPEC.md)。文档以可观察实现为准；计划、测试目标、离线结果与真实 Cloudflare 验收要分开写。
+先读 [README](README.md)、[部署与 profile 契约](docs/DEPLOYMENT.md)、[UI 说明](ui/README.md)、[Docker 边界](docs/DOCKER.md)和[维护验收规范](docs/MAINTENANCE-SPEC.md)。文档以可观察实现为准；计划、测试目标、离线结果与真实 Cloudflare 验收要分开写。
 
 ## 范围与开发约定
 
@@ -49,12 +49,29 @@ python -m pytest tests -q
 python -m pytest ui/tests -q
 python tests/test_cf_tunnel_accel.py
 python -m json.tool docs/profiles.example.json >/dev/null
+node --check ui/static/app.js
 git diff --check
 ```
 
 `py_compile` 必须显式包含无后缀 CLI 和辅助模块。两组 pytest 发现各目录测试；独立 unittest 入口只作额外兼容性检查，不替代 pytest/UI 测试。浏览器测试可能有额外运行依赖和启动边界，按实际测试文件要求单独记录，不把文件存在当成已运行。CI 的实际矩阵/步骤以 [.github/workflows/tests.yml](.github/workflows/tests.yml) 为准，不在文档固定用例数。
 
 不要把语法检查、AST 调用图检查、mock HTTP 或浏览器界面测试称为真实 Cloudflare provisioning 证明。真实 zone/SaaS 启用、证书签发、权威/公共 DNS、各地业务 Host/SNI 和速度表现需另行验收，不能在普通开发检查中偷偷执行。
+
+## Docker 与登录契约检查
+
+- 变更容器能力时同时核对 `/api/state.capabilities` 与 `/api/environment.environment.capabilities`。`local_tunnel_management: false` 只禁用 add/update/delete/服务映射，不额外禁用 switch/repair/CDN/health；`service_discovery: false` 不得显示成宿主无服务。未管理不是 DOWN。
+- 容器健康 `partial: true` / `scope: "container-network"` / `unchecked` 必须在 UI 与文档明确表达为有限范围，即使 `ok: true` 也不是完整健康。
+- 登录测试覆盖 32–1024 可打印字符/首尾空白、CLI 文件路径优先、环境值与文件冲突、只读外部来源不打印/持久化/轮换，以及 UI 变量不从 Cloudflare env 文件加载。
+- 托管随机密钥为 48 位十六进制、0600；首次成功绑定/启动才打印 `首次登录密钥: ...` 一次，重启不重打，关闭首次打印有效。测试不得向输出泄漏实际测试密钥。
+- Compose 检查 named state volume `/data` 的 UID 1000 初始化、配置只读绑定、回环端口、空 profiles 透传、非 root/只读根/cap-drop；不要把旧 `./data` bind 写回文档。
+
+可选的真实容器 E2E（需可用 Docker Engine/Compose 与构建依赖网络，**不是普通离线 pytest**）：先读 `tests/docker_e2e.py`，再从仓库根目录执行：
+
+```bash
+python tests/docker_e2e.py
+```
+
+该脚本使用隔离 Compose 项目及 fixture Cloudflare/后端服务，验证容器 HTTP 会话、密钥/状态持久化与能力边界，并清理测试资源。不连接真实 Cloudflare、不接管现有 connector，不证明公网业务成功。不要将普通开发 `config/`、宿主状态或真实凭据挂入测试；分享日志前确认不含首次登录密钥。`docker compose config --quiet` 可检查配置语法，避免输出包含自定义 UI 密钥的完整解析配置。
 
 ## 文档与 PR 检查单
 

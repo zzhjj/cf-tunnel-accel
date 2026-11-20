@@ -22,7 +22,25 @@ python3 ui/server.py --module "$PWD/cf-tunnel-accel" --host 127.0.0.1 --port 864
 
 包需保留相邻的 `cfa_config.py`、`cfa_ingress.py`、`cfa_cdn.py` 和完整静态资源，不要只更新 `server.py`。运行用户须能读 env/Token/Tunnel 凭据；写路由和重启 systemd 服务仍需相应权限。没有 systemd 时可前台查看 UI，但不等于所有服务管理操作可用。
 
-浏览器访问 `http://127.0.0.1:8642/`。UI 管理凭据首次生成于配置目录的 `ui-token`（0600），与 Cloudflare API Token 不同。默认目录是 `${XDG_CONFIG_HOME:-$HOME/.config}/cf-tunnel-accel`，可用 `CF_TUNNEL_ACCEL_UI_DIR` 覆盖。启动横幅只提示凭据文件，不回显内容；需查看时，在本机受保护终端使用 `cf-tunnel-ui --print-token`，不要将输出送入共享日志、截图或 issue。`--rotate-token` 用于显式重置本机 UI 凭据，不是 API Token 管理。
+浏览器访问 `http://127.0.0.1:8642/`。容器部署见 [Docker 快速开始](../docs/DOCKER.md)，无需先安装宿主 CLI/systemd。
+
+## 登录密钥
+
+UI 登录密钥与 Cloudflare API Token 不同，**不从 Cloudflare env 文件或 profile env 加载**，只读取 UI 进程自己的环境/参数。可选来源如下：
+
+- `CF_TUNNEL_ACCEL_UI_TOKEN`：显式字符串，须为 **32–1024 个可打印字符、单行且首尾无空白**。
+- `--token-file PATH` 或 `CF_TUNNEL_ACCEL_UI_TOKEN_FILE`：只读加载外部 UTF-8 普通文件，内容满足相同规则，可带一个末尾 LF/CRLF。CLI 路径优先于环境文件路径；环境密钥与任意选中的文件来源同时提供时报错。文件缺失、不可读或内容无效不会回退托管来源。
+- 两者均未提供时：使用托管 `ui-token`。原生默认目录是 `${XDG_CONFIG_HOME:-$HOME/.config}/cf-tunnel-accel`，也可依次由 `CF_TUNNEL_ACCEL_UI_DIR`、`CF_TUNNEL_ACCEL_CONFIG_DIR` 覆盖；Docker 为 `/data/ui-token`。缺失时生成随机 **48 位十六进制**密钥，原子保存为 **0600**，重启复用。
+
+首次生成托管密钥并成功绑定/启动后，日志以 `首次登录密钥: ...` **打印一次**（省略号不是实际密钥）；监听失败不生成/打印，正常重启不重打。日志因此含有管理凭据，应限制访问。通过 `--no-print-initial-token` 或 UI 进程环境 `CF_TUNNEL_ACCEL_UI_PRINT_INITIAL_TOKEN=0` 关闭首次打印；关闭后重启也不补打。自定义环境/文件密钥不自动打印，也不复制保存到托管文件。
+
+外部文件启动示例（文件须预先由管理员准备，路径替换为自己的路径）：
+
+```bash
+cf-tunnel-ui --token-file /secure/path/ui-login-key
+```
+
+需明确查看当前来源的密钥时，在受保护的本地终端执行 `cf-tunnel-ui --print-token`，该命令输出密钥后退出；外部 CLI 文件来源需带同一个 `--token-file` 参数。不要将输出送入共享日志、截图或 issue。`--rotate-token` 只轮换应用托管文件，外部来源会拒绝；更换自定义密钥应更新其来源并重启。它不是 Cloudflare API Token 管理。
 
 ## 六页路由优先布局
 
@@ -35,6 +53,8 @@ python3 ui/server.py --module "$PWD/cf-tunnel-accel" --host 127.0.0.1 --port 864
 | **任务审计** | 全局任务、归属 profile、日志、结果、错误和审计记录；不是云端事务日志 |
 | **环境** | 仅本地检查路径、依赖、就绪状态和凭据来源，不显示凭据内容；不在此开户或录入 API Token |
 
+容器模式不接管宿主 ingress、systemd 或外部 connector：新增/修改后端/删除/服务映射禁用，Tunnel 服务显示“未管理（容器）”，不将未管理当作 DOWN。`switch` / `repair`、CDN 和健康检查仍按正常就绪条件可用；环境页展示后端 `capabilities`。配置挂载、后端服务名及网络边界见 [Docker 说明](../docs/DOCKER.md)。
+
 旧的拓扑画布、印刷风版式或自动外部 DNS 接入不属于当前界面说明。
 
 ### 错误、部分数据与任务恢复
@@ -42,6 +62,7 @@ python3 ui/server.py --module "$PWD/cf-tunnel-accel" --host 127.0.0.1 --port 864
 - API、配置、zone、SaaS、DNS 或服务读取失败应显示具体分区错误/未知状态；其它可读部分仍可展示。空列表、过期快照、未知和健康状态不是同一件事。
 - 界面显示当前 profile、更新时点与任务状态；切换 profile 后不应让旧请求覆盖新视图。优先检查当前配置，再判断是否需要变更。
 - 写任务全局单写准入；冲突可返回 409，不静默并行重启 Tunnel。前端等待/断线不意味着任务未提交，不重复点击来“补执行”。
+- 容器健康任务的 `partial: true`、`scope: "container-network"` 和 `unchecked` 表示有限范围检查，宿主 systemd/connector 配置未检查；`ok: true` 也不是完整健康。
 - 诊断可以执行完但 `unhealthy`；变更返回失败也可能已经写了部分 DNS/SaaS/本地配置。以结果、日志及实际状态核对，不用“进度结束”替代成功判断。
 - 最近任务快照保存在 `ui-jobs.json`，有记录/日志容量上限，不是永久历史。UI 重启后未确认的 queued/running 任务标记 `interrupted`，**不自动重放、不从快照重新派发**。先检查目标资源，再人工决定下一步。
 - 任务存储或审计失败会削弱追踪能力，应处理存储错误；持久化不等于所有云端步骤具有持久事务。服务停止、代码回滚也不会撤销已经发生的外部变更。

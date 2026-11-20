@@ -43,6 +43,7 @@ class Fixture:
         self.state_verified = True
         self.services_warnings = []
         self.omit_submit_job = False
+        self.capabilities = None
 
     def job(self, ident='restored', op='health', profile='beta', status='running'):
         return dict(id=ident, op=op, profile=profile, status=status,
@@ -53,6 +54,7 @@ class Fixture:
 
     def state(self, profile):
         return dict(ok=True, version='fixture',
+                    capabilities=self.capabilities,
                     service=dict(name=profile + '.service', active=True),
                     preferred=dict(entry='cdn.example.org', target=None if not self.state_verified else 'edge.example.net', verified=self.state_verified),
                     counts=dict(routes=2, zones=1, saas=1),
@@ -136,6 +138,7 @@ class Fixture:
                         candidates=[dict(domain='edge.example.net'),dict(domain='next.example.net')], min_improvement=15)))
                 if u.path == '/api/environment':
                     return self.send(200,dict(ok=True,environment=dict(ready=fixture.environment_ready,
+                        capabilities=fixture.capabilities,
                         missing=[] if fixture.environment_ready else [dict(name='curl',reason='missing',recovery='install curl')],
                         config=dict(path='/fixture/config.yml',account=dict(value='fixture account',source='profile env')),
                         dependencies=dict(curl=True,systemd=False),credentials=dict(configured=True,source='profile token file',token='MUST_NOT_RENDER'))))
@@ -246,6 +249,38 @@ class BrowserTests(unittest.TestCase):
         job = next(reversed(self.f.jobs.values()))
         job.update(status=status,ended=1800000010,result={'ok':ok} if (op or job['op'])=='health' else {'changed':True},next=job['next']+1)
         return job
+
+    def test_container_capabilities_disable_only_local_controls_and_mark_partial_health(self):
+        self.f.capabilities = dict(runtime='container', local_tunnel_management=False,
+                                   service_discovery=False, health_scope='container-network')
+        self.page.goto(self.origin)
+        route = self.page.locator('[data-host="alpha.example.org"]')
+        expect(route).to_be_visible()
+        expect(self.page.locator('#route-add')).to_be_disabled()
+        expect(route.locator('[data-route-action="edit"]')).to_be_disabled()
+        expect(route.locator('[data-route-action="delete"]')).to_be_disabled()
+        expect(route.locator('[data-route-action="switch"]')).to_be_enabled()
+        expect(route.locator('[data-route-action="health"]')).to_be_enabled()
+        expect(self.page.locator('#state-summary')).to_contain_text('未管理（容器）')
+        self.nav('services')
+        expect(self.page.locator('#listener-list')).to_contain_text('不发现宿主监听')
+        self.assertEqual(self.page.locator('[data-bind]').count(), 0)
+        self.nav('cdn')
+        expect(self.page.locator('#cdn-test')).to_be_enabled()
+        expect(self.page.locator('#cdn-best')).to_be_enabled()
+        self.nav('environment')
+        expect(self.page.locator('#environment-content')).to_contain_text('container-network')
+        self.nav('routes')
+        route.locator('[data-route-action="health"]').click()
+        expect(self.page.locator('#task-title')).to_contain_text('health')
+        job = self.finish(op='health')
+        job['result'].update(partial=True, scope='container-network',
+                             unchecked=['host-systemd','host-connector-config'])
+        self.nav('activity')
+        expect(self.page.locator('#job-detail-notice')).to_contain_text('有限范围检查', timeout=8000)
+        expect(self.page.locator('#job-detail-notice')).to_contain_text('不代表完整健康')
+        expect(self.page.locator('#job-detail-notice')).to_contain_text('host-systemd')
+
 
     def test_default_navigation_independent_failures_and_environment(self):
         self.f.errors['/api/audit'] = 500

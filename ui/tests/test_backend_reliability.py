@@ -231,6 +231,9 @@ class StartupShutdownTests(unittest.TestCase):
             env = dict(self.env)
             if override is not None:
                 env['CF_TUNNEL_ACCEL_UI_TOKEN_FILE'] = str(override)
+                override.parent.mkdir(parents=True)
+                override.write_text('explicit-readonly-fixture-key-00000001\n')
+                override.chmod(0o600)
             result = subprocess.run([sys.executable, str(self.server_path), '--print-token'],
                                     env=env, cwd=self.root, capture_output=True, timeout=5,
                                     text=True)

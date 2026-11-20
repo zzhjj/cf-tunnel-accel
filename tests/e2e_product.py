@@ -272,7 +272,7 @@ socket.create_connection=connect
                     deadline = time.monotonic() + 15
                     while time.monotonic() < deadline:
                         if process.poll() is not None:
-                            self.fail('UI startup failed: ' + (base / 'ui-server.log').read_text())
+                            self.fail('UI startup failed; bootstrap log withheld because it may contain a login key')
                         try:
                             with socket.create_connection(('127.0.0.1', port), timeout=.2):
                                 break
@@ -292,7 +292,6 @@ socket.create_connection=connect
                             page.locator('#token').press('Enter')
                             page.wait_for_timeout(1500)
                             print('UI baseline notices:', page.locator('#profile-status').inner_text(), page.locator('#routes-notice').inner_text())
-                            print('UI baseline server:', (base / 'ui-server.log').read_text()[-3500:])
                             expect(page.locator('#route-grid')).to_contain_text('alpha.example.net')
                             page.locator('#profile-select').select_option('beta')
                             expect(page.locator('#route-grid')).to_contain_text('beta.example.net')

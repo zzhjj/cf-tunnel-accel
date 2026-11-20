@@ -1,0 +1,45 @@
+services:
+  cf-tunnel-accel:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    image: cf-tunnel-accel:local
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${CFA_DOCKER_PORT:-8642}:8642"
+    environment:
+      HOME: /data
+      CF_TUNNEL_ACCEL_CONFIG_DIR: /data
+      CF_TUNNEL_ACCEL_UI_DIR: /data
+      CF_TUNNEL_ACCEL_ENV_FILE: /config/env
+      CF_TUNNEL_ACCEL_RUNTIME: container
+      CF_TUNNEL_ACCEL_UI_PROFILES: ${CF_TUNNEL_ACCEL_UI_PROFILES:-}
+      CF_TUNNEL_ACCEL_UI_TOKEN: ${CF_TUNNEL_ACCEL_UI_TOKEN:-}
+      CF_TUNNEL_ACCEL_UI_TOKEN_FILE: ${CF_TUNNEL_ACCEL_UI_TOKEN_FILE:-}
+      CF_TUNNEL_ACCEL_UI_PRINT_INITIAL_TOKEN: ${CF_TUNNEL_ACCEL_UI_PRINT_INITIAL_TOKEN:-1}
+    volumes:
+      - type: volume
+        source: state
+        target: /data
+      - type: bind
+        source: ${CFA_DOCKER_CONFIG_DIR:-./config}
+        target: /config
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+
+volumes:
+  state: {}
+
+networks:
+  default:
+    driver: bridge

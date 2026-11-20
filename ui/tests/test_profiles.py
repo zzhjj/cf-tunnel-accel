@@ -86,6 +86,13 @@ class ProfileTests(unittest.TestCase):
         metadata["name"] = "changed"
         self.assertEqual(profiles.profile_metadata(first), a)
 
+    def test_container_process_boundary_cannot_be_overridden_by_profile(self):
+        with patch.dict(os.environ, {'CF_TUNNEL_ACCEL_RUNTIME': 'container'}):
+            loaded = self.load([self.entry('a', 'CF_TUNNEL_ACCEL_RUNTIME=host\n')])
+        self.assertEqual(loaded['a'].RUNTIME_MODE, 'container')
+        self.assertFalse(loaded['a'].runtime_capabilities()['local_tunnel_management'])
+
+
     def test_runtime_helpers_use_the_profile_snapshot_not_live_environment(self):
         loaded = self.load([self.entry('a'), self.entry('b')])
         for ident, module in loaded.items():

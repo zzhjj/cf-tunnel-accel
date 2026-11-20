@@ -227,6 +227,30 @@ class TokenFileTest(unittest.TestCase):
                 mod.TOKEN_PATH = original
 
 
+    def test_failed_rotation_preserves_original_key(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(mod, 'TOKEN_PATH', Path(td) / 'token'):
+            key, _ = mod.load_or_create_token()
+            before = mod.TOKEN_PATH.read_bytes()
+            with mock.patch.object(mod.os, 'replace', side_effect=OSError('fixture failure')):
+                with self.assertRaises(OSError):
+                    mod.load_or_create_token(rotate=True)
+            self.assertTrue(mod.TOKEN_PATH.read_bytes() == before)
+            self.assertTrue(mod.load_or_create_token()[0] == key)
+            self.assertEqual(list(Path(td).glob('.ui-token-*')), [])
+
+    def test_concurrent_creation_preserves_a_single_complete_key(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(mod, 'TOKEN_PATH', Path(td) / 'token'):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(lambda _: mod.load_or_create_token(), range(16)))
+            self.assertEqual(sum(created for _, created in results), 1)
+            self.assertTrue(len({key for key, _ in results}) == 1)
+            self.assertTrue(mod.TOKEN_PATH.read_text().strip() == results[0][0])
+            self.assertEqual(mod.TOKEN_PATH.stat().st_mode & 0o777, 0o600)
+
+
 class ThrottleTest(unittest.TestCase):
     def test_free_attempts_then_exponential_lock(self):
         t = mod.Throttle()

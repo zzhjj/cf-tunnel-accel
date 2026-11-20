@@ -6,7 +6,7 @@
 
 安全设计（首页即闸门，不是装饰）
   * 默认只监听 127.0.0.1；要对外用 --host 0.0.0.0，并知悉 token 是唯一凭据。
-  * 访问凭据是 0600 文件的 48 位 hex token，恒定时间比较，从不出现在页面里。
+  * 支持外部配置的 UI 登录密钥；默认 0600 文件、恒定时间比较、不出现在页面里。
   * 登录失败按 IP 指数退避 + 锁定，全部写审计日志。
   * 会话只用 HttpOnly Cookie 保存，页面 JS 拿不到；写操作要额外带 CSRF 头，
     并校验 Origin / Sec-Fetch-Site，跨站表单打不进来。
@@ -27,6 +27,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import socket
 import subprocess
 import sys
@@ -66,9 +67,7 @@ DEFAULT_MODULE = default_module_path()
 CONFIG_DIR = Path(os.environ.get('CF_TUNNEL_ACCEL_UI_DIR', os.environ.get(
     'CF_TUNNEL_ACCEL_CONFIG_DIR', str(Path(os.environ.get('XDG_CONFIG_HOME') or
                                            Path.home() / '.config') / 'cf-tunnel-accel')))).expanduser()
-TOKEN_PATH = Path(
-    os.environ.get("CF_TUNNEL_ACCEL_UI_TOKEN_FILE", str(CONFIG_DIR / "ui-token"))
-)
+TOKEN_PATH = CONFIG_DIR / 'ui-token'  # Only the app-managed file may be created or rotated.
 CDN_HISTORY_PATH = Path(
     os.environ.get("CF_TUNNEL_ACCEL_UI_CDN_HISTORY", str(CONFIG_DIR / "ui-cdn-history.json"))
 )
@@ -86,6 +85,23 @@ MAX_JOB_LINES = 800
 MAX_PENDING_JOBS = 32
 SHUTDOWN_DRAIN_SECONDS = 10
 MUTATING_OPS = frozenset({'add', 'update', 'delete', 'switch', 'repair', 'cdn-set', 'cdn-best'})
+LOCAL_TUNNEL_OPS = frozenset({'add', 'update', 'delete'})
+
+
+class LocalTunnelUnmanaged(ValueError):
+    pass
+
+
+def runtime_capabilities(accel) -> dict:
+    container = getattr(accel, '_container_runtime', False) or getattr(accel, 'RUNTIME_MODE', 'host') == 'container'
+    return {'runtime': 'container' if container else 'host',
+            'local_tunnel_management': not container, 'service_discovery': not container,
+            'health_scope': 'container-network' if container else 'host'}
+
+
+def local_operation_guard(accel, op: str) -> None:
+    if op in LOCAL_TUNNEL_OPS and not runtime_capabilities(accel)['local_tunnel_management']:
+        raise LocalTunnelUnmanaged('容器不管理宿主 ingress/服务；请在宿主 CLI 执行此操作')
 
 
 class JobBusy(ValueError):
@@ -118,24 +134,62 @@ def load_accel(path: Path, name: str = "cf_tunnel_accel"):
 # --------------------------------------------------------------------------
 # 凭据 / 会话 / 审计
 # --------------------------------------------------------------------------
-def load_or_create_token() -> Tuple[str, bool]:
-    """返回 (token, 是否新建)。文件权限必须 0600。"""
-    try:
-        raw = TOKEN_PATH.read_text(encoding="utf-8").strip()
-        if len(raw) >= 32:
-            mode = TOKEN_PATH.stat().st_mode & 0o777
-            if mode != 0o600:
-                os.chmod(TOKEN_PATH, 0o600)
-            return raw, False
-    except FileNotFoundError:
-        pass
+def validate_login_key(value: str) -> str:
+    if not 32 <= len(value) <= 1024 or not value.isprintable() or value != value.strip():
+        raise ValueError('登录密钥须为 32–1024 个可打印字符，单行且首尾无空白')
+    return value
+
+
+def read_login_key(path: Path, *, managed: bool = False) -> str:
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if managed:
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    with os.fdopen(fd, 'rb') as fh:
+        mode = os.fstat(fh.fileno()).st_mode
+        if not stat.S_ISREG(mode):
+            raise ValueError('登录密钥文件必须是普通文件')
+        raw = fh.read(4099)
+        if len(raw) > 4098:
+            raise ValueError('登录密钥文件过长')
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeError:
+            raise ValueError('登录密钥文件必须为 UTF-8') from None
+        key = validate_login_key(text[:-2] if text.endswith('\r\n') else text.removesuffix('\n'))
+        if managed and stat.S_IMODE(mode) != 0o600:
+            os.fchmod(fh.fileno(), 0o600)
+        return key
+
+
+def load_or_create_token(*, rotate: bool = False) -> Tuple[str, bool]:
+    """Atomically publish a private managed token; retain the winner on concurrent creation."""
+    if not rotate:
+        try:
+            return read_login_key(TOKEN_PATH, managed=True), False
+        except FileNotFoundError:
+            pass
+    elif os.path.lexists(TOKEN_PATH) and not stat.S_ISREG(TOKEN_PATH.lstat().st_mode):
+        raise ValueError('仅能轮换应用管理的普通密钥文件')
+
     token = secrets.token_hex(24)
-    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT, 0o600)
-    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-        os.fchmod(fh.fileno(), 0o600)
-        fh.truncate(0)
-        fh.write(token + '\n')
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix='.ui-token-', dir=TOKEN_PATH.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            fh.write(token + '\n')
+            fh.flush()
+            os.fsync(fh.fileno())
+        if rotate:
+            os.replace(name, TOKEN_PATH)
+        else:
+            try:
+                os.link(name, TOKEN_PATH)
+            except FileExistsError:
+                return read_login_key(TOKEN_PATH, managed=True), False
+    finally:
+        Path(name).unlink(missing_ok=True)
     return token, True
 
 
@@ -449,6 +503,9 @@ def _http_address(addr: str) -> str:
 def discover_services(accel, with_probe: bool = True, *, warnings: Optional[List[str]] = None) -> List[dict]:
     """List local listeners, preserving endpoint and process identity."""
     warnings = warnings if warnings is not None else []
+    if not runtime_capabilities(accel)['service_discovery']:
+        warnings.append('容器视角不枚举宿主监听；请使用服务 DNS 名或宿主网关进行显式后端探测。')
+        return []
     ss = shutil.which('ss')
     if not ss:
         warnings.append('缺少 ss（iproute2），无法读取本机监听服务。')
@@ -700,6 +757,9 @@ class JobRunner:
                     pass
 
     def submit(self, op: str, args: dict, actor: str, profile: str = 'default') -> Job:
+        if profile not in self.profiles:
+            raise ValueError('未知 profile ID')
+        local_operation_guard(self.profiles[profile], op)
         job = Job(op, dict(args), actor, profile)
         with self.cv:
             if self.closed:
@@ -901,6 +961,7 @@ class JobRunner:
 
     def _dispatch(self, job: Job) -> Any:
         accel = self.profiles[getattr(job, 'profile', 'default')]
+        local_operation_guard(accel, job.op)
         a = job.args
         if job.op == "add":
             result = accel.add_accelerated_service(
@@ -927,7 +988,11 @@ class JobRunner:
             return merge_result(accel.switch_to_preferred(a['hostname']), hostname=a['hostname'])
         if job.op == "health":
             ok = accel.health_check(a.get("hostname") or None, include_https=bool(a.get("https")))
-            return merge_result(ok, ok=bool(ok), hostname=a.get('hostname'))
+            result = merge_result(ok, ok=bool(ok), hostname=a.get('hostname'))
+            if runtime_capabilities(accel)['runtime'] == 'container':
+                result.update(partial=True, scope='container-network',
+                              unchecked=['host-systemd', 'host-connector-config'])
+            return result
         if job.op == "cdn-test":
             return self._cdn_bench(job)
         if job.op == "cdn-set":
@@ -960,7 +1025,8 @@ class JobRunner:
 def environment_status(accel) -> dict:
     status = getattr(accel, 'configuration_status', None)
     if status is not None:
-        return status()  # Pure local, intentionally independent of the API.
+        report = status()  # Pure local, intentionally independent of the API.
+        return {**report, 'capabilities': runtime_capabilities(accel)}
     # Legacy test doubles/CLI expose less metadata; never infer API access.
     return {'ready': True, 'missing': [],
             'config': {'path': str(getattr(accel, 'CONFIG_PATH', '') or ''),
@@ -1046,6 +1112,8 @@ def _check_section(errors: dict, freshness: dict, name: str, reader, default=Non
 
 
 def _service_status(accel) -> dict:
+    if not runtime_capabilities(accel)['local_tunnel_management']:
+        return {'name': accel.SERVICE_NAME, 'active': None, 'state': 'unmanaged', 'mainpid': None}
     name = accel.SERVICE_NAME
     if not name:
         raise ValueError('未配置 Tunnel 服务名称；请检查 cf-tunnel-accel env')
@@ -1092,6 +1160,7 @@ def _build_state(accel) -> dict:
                      'saas': {'status': ch.get('status'), 'ssl': (ch.get('ssl') or {}).get('status')} if ch else None})
     rows.sort(key=lambda r: r['hostname'])
     return {
+        'capabilities': runtime_capabilities(accel),
         'version': getattr(accel, 'SCRIPT_VERSION', '?'),
         'service': service, 'config_path': str(accel.CONFIG_PATH or ''),
         'preferred': {'entry': accel.PREFERRED_ENTRY or None, 'target': preferred,
@@ -1264,10 +1333,12 @@ CSP = (
 
 
 class App:
-    def __init__(self, accel, token: str, host: str, port: int, token_created: bool, profiles=None):
+    def __init__(self, accel, token: str, host: str, port: int, token_created: bool, profiles=None, *, container: bool = False):
         self.accel = accel
         self.profiles = profiles or {'default': accel}
+        self.container = container or runtime_capabilities(accel)['runtime'] == 'container'
         for key, module in self.profiles.items():
+            module._container_runtime = self.container
             module._profile_id = key
             metadata = getattr(module, '_profile_metadata', {})
             module._profile_name = metadata.get('name', key)
@@ -1456,6 +1527,7 @@ class Handler(BaseHTTPRequestHandler):
         accel = app.accel
         parts = path.split('/')
         methods = {
+            'health': ('GET',),
             'session': ('GET', 'POST', 'DELETE'),
             'profiles': ('GET',), 'environment': ('GET',), 'state': ('GET',),
             'services': ('GET',), 'cdn': ('GET',), 'audit': ('GET',),
@@ -1469,6 +1541,9 @@ class Handler(BaseHTTPRequestHandler):
         if method not in allowed:
             allow = ', '.join((*allowed, 'HEAD'))
             return self._json(405, {'ok': False, 'error': 'method not allowed'}, {'Allow': allow})
+
+        if parts == ['health']:
+            return self._json(200, {'ok': True, 'status': 'ok'})
 
         # 会话建立不需要已有会话
         if parts == ['session']:
@@ -1578,6 +1653,10 @@ class Handler(BaseHTTPRequestHandler):
                     body["target"] = target
                 body["force"] = bool(body.get("force"))
             try:
+                local_operation_guard(accel, op)
+            except LocalTunnelUnmanaged as exc:
+                return self._error(409, str(exc), code='local_tunnel_unmanaged')
+            try:
                 job = app.runner.submit(op, body, actor=self._ip(), profile=profile_id)
             except JobBusy as exc:
                 return self._error(409, str(exc))
@@ -1656,13 +1735,19 @@ class Handler(BaseHTTPRequestHandler):
         )
 
 
-def make_server(app: App) -> ThreadingHTTPServer:
-    handler = type("BoundHandler", (Handler,), {"app": app})
+def bind_http_server(host: str, port: int) -> ThreadingHTTPServer:
+    handler = type('BoundHandler', (Handler,), {})
     server_type = ThreadingHTTPServer
-    if ':' in app.host:
+    if ':' in host:
         server_type = type('IPv6HTTPServer', (ThreadingHTTPServer,), {'address_family': socket.AF_INET6})
-    httpd = server_type((app.host, app.port), handler)
+    httpd = server_type((host, port), handler)
     httpd.daemon_threads = True
+    return httpd
+
+
+def make_server(app: App) -> ThreadingHTTPServer:
+    httpd = bind_http_server(app.host, app.port)
+    httpd.RequestHandlerClass.app = app
     return httpd
 
 
@@ -1680,21 +1765,18 @@ def _lan_ip() -> str:
         return "127.0.0.1"
 
 
-def banner(app: App) -> None:
-    shown_host = "127.0.0.1" if app.host in ("0.0.0.0", "") else app.host
-    print("\n  ARC · cf-tunnel-accel console")
-    print(f"  ────────────────────────────────────────────")
-    print(f"  访问   http://{_http_address(shown_host)}:{app.port}/")
-    if app.host in ("0.0.0.0", ""):
-        print(f"  局域网 http://{_lan_ip()}:{app.port}/   (绑定 0.0.0.0，凭据是唯一门槛)")
-    print(f"  凭据   {TOKEN_PATH}")
-    if app.token_created:
-        print('  新凭据已写入 0600 文件；使用 --print-token 在本机读取。')
-    print(f"  审计   {AUDIT_PATH}")
-    print(f"  任务   {JOBS_PATH}")
-    print(f"  模块   cf-tunnel-accel {getattr(app.accel, 'SCRIPT_VERSION', '?')}")
-    print()
-
+def banner(app: App, key_source: str, *, print_initial: bool) -> None:
+    shown_host = '127.0.0.1' if app.host in ('0.0.0.0', '') else app.host
+    lines = ['', '  ARC · cf-tunnel-accel console', f'  凭据   {key_source}']
+    if app.token_created and print_initial:
+        lines.append('  首次登录密钥: ' + app.token)
+        lines.append('  已保存到 0600 文件；重启将复用密钥，不再打印。')
+    if app.host in ('0.0.0.0', '') and not app.container:
+        lines.append(f'  局域网 http://{_lan_ip()}:{app.port}/（请限制访问范围）')
+    lines.extend((f'  审计   {AUDIT_PATH}', f'  任务   {JOBS_PATH}',
+                  f"  模块   cf-tunnel-accel {getattr(app.accel, 'SCRIPT_VERSION', '?')}",
+                  f'  访问   http://{_http_address(shown_host)}:{app.port}/', ''))
+    print('\n'.join(lines), flush=True)
 
 def load_console_profiles(module: str, registry, parser) -> Tuple[Any, Dict[str, Any]]:
     """Load the CLI module(s) backing the console.
@@ -1725,36 +1807,64 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--host", default=os.environ.get("ARC_HOST", "127.0.0.1"))
     parser.add_argument('--port', type=int, default=os.environ.get('ARC_PORT', '8642'))
     parser.add_argument("--module", default=str(DEFAULT_MODULE))
-    parser.add_argument('--profiles', type=Path, default=os.environ.get('CF_TUNNEL_ACCEL_UI_PROFILES'))
+    parser.add_argument('--profiles', type=Path, default=os.environ.get('CF_TUNNEL_ACCEL_UI_PROFILES') or None)
     parser.add_argument('--allow-remote-http', action='store_true',
                         help='仅用于受信 TLS 反向代理后的非回环监听')
-    parser.add_argument("--print-token", action="store_true", help="打印当前凭据后退出")
-    parser.add_argument("--rotate-token", action="store_true", help="重置凭据")
+    parser.add_argument('--token-file', help='从指定文件只读加载 UI 登录密钥')
+    parser.add_argument('--no-print-initial-token', action='store_true', help='首次生成时也不在启动日志打印密钥')
+    parser.add_argument('--print-token', action='store_true', help='从受保护的本地终端读取当前密钥后退出')
+    parser.add_argument('--rotate-token', action='store_true', help='原子替换应用托管的密钥文件（外部配置不适用）')
     args = parser.parse_args(argv)
 
     if not 0 <= args.port <= 65535:
         parser.error('port 必须在 0–65535 之间')
     if not args.print_token and not (_is_loopback(args.host) or args.host == 'localhost') and not args.allow_remote_http:
-        parser.error('非回环 HTTP 监听需显式 --allow-remote-http，并部署 TLS 反向代理')
-    if not args.print_token:
-        accel, profiles = load_console_profiles(args.module, args.profiles, parser)
-    try:
-        if args.rotate_token:
-            TOKEN_PATH.unlink(missing_ok=True)
-        token, created = load_or_create_token()
-    except (OSError, ValueError) as exc:
-        parser.error(f'访问凭据文件 {TOKEN_PATH} 读取/写入失败: {exc}')
+        parser.error('非回环 HTTP 监听需显式 --allow-remote-http，并限制监听范围')
+    runtime = os.environ.get('CF_TUNNEL_ACCEL_RUNTIME') or 'host'
+    if runtime not in ('host', 'container'):
+        parser.error('CF_TUNNEL_ACCEL_RUNTIME 须为 host 或 container')
+    initial_log = os.environ.get('CF_TUNNEL_ACCEL_UI_PRINT_INITIAL_TOKEN') or '1'
+    if initial_log not in ('0', '1'):
+        parser.error('CF_TUNNEL_ACCEL_UI_PRINT_INITIAL_TOKEN 须为 0 或 1')
+
+    key_value = os.environ.pop('CF_TUNNEL_ACCEL_UI_TOKEN', '')
+    key_file = args.token_file if args.token_file is not None else os.environ.get('CF_TUNNEL_ACCEL_UI_TOKEN_FILE') or None
+    if key_file == '':
+        parser.error('--token-file 需要非空路径')
+    if key_value and key_file is not None:
+        parser.error('CF_TUNNEL_ACCEL_UI_TOKEN 与密钥文件只能选一种')
+    if args.rotate_token and (key_value or key_file is not None):
+        parser.error('--rotate-token 仅支持应用托管的密钥；请更新显式配置来源')
+    key_path = Path(key_file).expanduser() if key_file is not None else TOKEN_PATH
+    key_source = 'CF_TUNNEL_ACCEL_UI_TOKEN' if key_value else str(key_path)
+
+    def select_key() -> Tuple[str, bool]:
+        try:
+            if key_value:
+                return validate_login_key(key_value), False
+            if key_file is not None:
+                return read_login_key(key_path), False
+            return load_or_create_token(rotate=args.rotate_token)
+        except (OSError, ValueError) as exc:
+            parser.error(f'登录密钥配置错误 ({key_source}): {exc}')
+
     if args.print_token:
-        print(token)
+        print(select_key()[0])
         return 0
 
-    app = App(accel, token, args.host, args.port, created, profiles)
+    accel, profiles = load_console_profiles(args.module, args.profiles, parser)
     try:
-        httpd = make_server(app)
+        httpd = bind_http_server(args.host, args.port)
     except OSError as exc:
-        app.runner.close(drain=False, timeout=SHUTDOWN_DRAIN_SECONDS)
         parser.error(f'监听 {args.host}:{args.port} 失败: {exc}；请检查地址或更换 --port')
-    app.port = httpd.server_address[1]
+    try:
+        token, created = select_key()
+        app = App(accel, token, args.host, httpd.server_address[1], created, profiles,
+                  container=(runtime == 'container'))
+        httpd.RequestHandlerClass.app = app
+    except BaseException:
+        httpd.server_close()
+        raise
 
     # Poll accept with a short bound. The handler only flips a flag: calling
     # BaseServer.shutdown() here would wait on the same serving thread.
@@ -1766,7 +1876,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     previous = signal.signal(signal.SIGTERM, stop)
     try:
-        banner(app)
+        banner(app, key_source, print_initial=(initial_log == '1' and not args.no_print_initial_token))
         httpd.timeout = 0.25
         while not stopping:
             httpd.handle_request()

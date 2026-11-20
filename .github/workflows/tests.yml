@@ -73,3 +73,18 @@ jobs:
         run: |
           python ui/tests/ui_e2e.py
           python tests/e2e_product.py
+
+  docker-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check Compose syntax
+        run: docker compose config --quiet
+      - name: Build runtime-only image
+        run: docker build --tag cf-tunnel-accel:local .
+      - name: Real Compose HTTP, persistence, capability and loopback tests
+        run: python tests/docker_e2e.py --no-build

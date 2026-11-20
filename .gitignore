@@ -15,3 +15,12 @@ credentials*.json
 *.pem
 *.key
 .DS_Store
+
+# 本地 Docker 配置及 UI 状态（不屏蔽 docs 中的跟踪模板）
+/config/
+/data/
+ui-token
+ui-audit.log
+ui-jobs.json
+ui-cdn-history*.json
+docker-compose.override.yml
