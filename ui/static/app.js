@@ -138,6 +138,7 @@
       S.parts[part] = {version, loading: false, updated: Date.now(), serverUpdated: updated, error: error || null, partial: Boolean(error)};
       if (part === 'state' && S.state) renderState();
       if (part === 'environment' && S.state) renderState();
+      if (['state', 'environment'].includes(part)) renderServices();
       if (part === 'environment' && !S.environment.ready) notice(part, '环境未就绪：请处理下方缺失项后重试', 'warning');
       else notice(part, error ? `部分数据未确认：${error}` : warning ? `检查提示：${warning}；读取时间：${timeText(updated || Date.now() / 1000)}` : `读取时间：${timeText(updated || Date.now() / 1000)}`, error ? 'error' : warning ? 'warning' : '');
     } catch (err) {
@@ -170,16 +171,29 @@
     return S.authenticated && !!S.profile && !!S.state && !readFailed && !statePart?.loading
       && !S.state.errors?.config && readiness !== false && readiness?.ready !== false && S.environment?.ready !== false;
   }
+  // Either endpoint can arrive first; an explicit capability denial takes precedence.
+  function capabilityAllowed(name) {
+    return ![S.state?.capabilities, S.environment?.capabilities].some(c => c?.[name] === false);
+  }
   function busy() { return S.submitting || S.uncertain || [...S.jobs.values()].some(isPending); }
   function updateControls() {
-    $('#route-add').disabled = !writeReady() || busy();
+    const localReady = capabilityAllowed('local_tunnel_management');
+    $('#route-add').disabled = !localReady || !writeReady() || busy();
+    $('#route-add').title = localReady ? '' : '容器不管理宿主 ingress/服务，请在宿主 CLI 操作';
     const cdnReady = S.authenticated && !!S.cdn && !(S.parts.cdn?.error && !S.parts.cdn?.partial) && !S.parts.cdn?.loading;
     $('#cdn-test').disabled = !S.profile || !S.authenticated || busy() || !cdnReady;
     $('#cdn-best').disabled = !writeReady() || !cdnReady || busy();
     $('#cdn-manual-go').disabled = !writeReady() || !cdnReady || busy();
     $('#diag-run').disabled = !S.profile || !S.authenticated || busy();
-    $$('[data-route-action]').forEach(b => { b.disabled = busy() || (b.dataset.routeAction === 'health' ? !S.authenticated : !writeReady()); });
-    $$('[data-bind]').forEach(b => { b.disabled = !writeReady() || busy(); });
+    $$('[data-route-action]').forEach(b => {
+      const localAction = ['edit', 'delete'].includes(b.dataset.routeAction);
+      b.disabled = busy() || (localAction && !localReady) || (b.dataset.routeAction === 'health' ? !S.authenticated : !writeReady());
+      b.title = localAction && !localReady ? '容器不管理宿主 ingress/服务，请在宿主 CLI 操作' : '';
+    });
+    $$('[data-bind]').forEach(b => {
+      b.disabled = !localReady || !writeReady() || busy();
+      b.title = localReady ? '' : '容器不管理宿主 ingress/服务，请在宿主 CLI 操作';
+    });
     $$('[data-cdn-set]').forEach(b => { b.disabled = !writeReady() || !cdnReady || busy() || b.dataset.current === 'true'; });
     renderBanner();
   }
@@ -222,13 +236,14 @@
     const verified = preferred.verified === true && !S.parts.state?.error;
     const service = d.service;
     const stateFailed = !!S.parts.state?.error;
-    const serviceText = stateFailed ? '状态未确认' : service.active === true ? '运行中' : service.active === false ? '未运行' : '状态未知';
+    const unmanaged = service.state === 'unmanaged' || !capabilityAllowed('local_tunnel_management');
+    const serviceText = unmanaged ? '未管理（容器）' : stateFailed ? '状态未确认' : service.active === true ? '运行中' : service.active === false ? '未运行' : '状态未知';
     const readiness = d.readiness;
     const reportedReady = typeof readiness === 'boolean' ? readiness : readiness?.ready;
     const ready = (!S.parts.state?.partial && S.parts.state?.error) || d.errors?.config || S.environment?.ready === false ? false : reportedReady;
     $('#state-summary').innerHTML = [
       ['路由数量', d.counts?.routes === null || d.errors?.config ? '未确认' : `${d.routes.length}${stateFailed ? '（上次读取）' : ''}`],
-      ['Tunnel 服务', `${esc(service.name || '未提供')} ${status(serviceText, service.active === true && !stateFailed ? 'good' : 'pending')}`],
+      ['Tunnel 服务', `${esc(service.name || '未提供')} ${status(serviceText, service.active === true && !stateFailed && !unmanaged ? 'good' : 'pending')}`],
       ['优选目标', preferred.target && verified ? `${esc(preferred.target)} ${status('已验证','good')}` : `${esc(preferred.target || '未知')} ${status('未验证')}`],
       ['写入准备', status(ready === true ? '已就绪' : ready === false ? '未就绪' : '后端未提供就绪检查', ready === true ? 'good' : 'pending')],
     ].map(([title,value])=>`<div class="card summary"><span class="muted">${title}</span><div>${value}</div></div>`).join('');
@@ -256,6 +271,10 @@
     return `http://127.0.0.1:${s.port}`;
   }
   function renderServices() {
+    if (!capabilityAllowed('service_discovery')) {
+      $('#listener-list').innerHTML = '<p class="empty">未管理（容器）：不发现宿主监听服务；请在宿主 CLI 管理 ingress/服务。</p>';
+      return;
+    }
     if (!S.services) return;
     const q = $('#services-filter').value.toLowerCase(), scope = $('#services-scope').value;
     const rows = S.services.filter(s => {
@@ -291,6 +310,7 @@
     const e = S.environment;
     $('#environment-content').innerHTML = `${status(e.ready ? '环境已就绪' : '环境未就绪', e.ready ? 'good' : 'bad')}
       <h2>缺失项</h2>${Array.isArray(e.missing) && !e.missing.length ? '<p>未报告缺失项</p>' : safeRows(e.missing || '后端未提供')}
+      <h2>运行能力</h2>${safeRows(e.capabilities)}
       <h2>配置与来源</h2>${safeRows(e.config)}<h2>运行依赖</h2>${safeRows(e.dependencies)}
       <h2>凭据</h2><dl><dt>配置状态</dt><dd>${e.credentials?.configured === true ? '已配置（不代表 API 权限已验证）' : e.credentials?.configured === false ? '未配置' : '未提供'}</dd><dt>来源</dt><dd>${esc(e.credentials?.source || '未提供')}</dd></dl>${e.recovery ? `<h2>恢复建议</h2>${safeRows(e.recovery)}` : ''}`;
   }
@@ -334,7 +354,7 @@
     openModal('外部域名：手动 DNS', `<p><code>${esc(route.hostname)}</code> 的 DNS 不由当前账户管理。此操作不提交后台任务。</p><p>在终端加载与此配置相同的环境后执行 <code>cf-tunnel-accel env</code> 核对来源。新增使用：</p><pre>cf-tunnel-accel add ${esc(route.hostname)} http://127.0.0.1:8080 --external</pre><p>按 CLI 提示手动添加 DCV 和 DNS-only CNAME，返回终端确认。切换/删除时在域名 DNS 平台手动处理相应记录；CLI 的 <code>switch</code> / <code>del</code> 仅处理其可管理部分。</p>`, () => true, {label: '知道了'});
   }
   function openRouteForm(route = null, preset = '') {
-    if (!writeReady() || busy()) return;
+    if (!capabilityAllowed('local_tunnel_management') || !writeReady() || busy()) return;
     const zones = (S.state.zones || []).filter(z => z.status === 'active').map(z=>z.name);
     openModal(route ? '修改路由后端' : '新增路由', `${route ? `<p>域名：<b>${esc(route.hostname)}</b>。只修改 ingress 后端，可能重启隧道，不更改 DNS/SaaS。</p>` : field('业务域名','f-host','','app.example.com')}
       ${field('本机后端','f-service',route?.service || preset,'http://127.0.0.1:8080')}
@@ -353,6 +373,7 @@
   function routeAction(action, host) {
     const route = S.state?.routes.find(r => r.hostname === host);
     if (!route) return;
+    if (['edit', 'delete'].includes(action) && !capabilityAllowed('local_tunnel_management')) return;
     if (action === 'edit') return openRouteForm(route);
     if (action === 'health') return startHealth(host, true);
     if (route.external === true) return externalInfo(route);
@@ -389,7 +410,13 @@
     if (job.status === 'interrupted') return `执行已中断，结果未确认；不会自动重试${job.error ? '：' + job.error : ''}`;
     if (job.status === 'error' || job.error || job.op !== 'health' && job.result?.ok === false) return `任务失败${job.error || job.result?.error ? '：' + (job.error || job.result.error) : ''}`;
     if (job.status === 'done') {
-      if (job.op === 'health') return job.result?.ok === true ? '执行结束，检查通过' : job.result?.ok === false ? '执行结束，检查未通过' : '执行结束，检查结果未提供';
+      if (job.op === 'health') {
+        const result = job.result;
+        const limited = result?.partial === true || result?.scope === 'container-network';
+        const check = result?.ok === true ? '检查通过' : result?.ok === false ? '检查未通过' : '检查结果未提供';
+        const unchecked = Array.isArray(result?.unchecked) ? result.unchecked.join('、') : '';
+        return limited ? `执行结束，有限范围检查（${result.scope || '范围未提供'}）：${check}；不代表完整健康${unchecked ? '；未检查：' + unchecked : ''}` : `执行结束，${check}`;
+      }
       return '执行结束' + (['warning','failed'].includes(job.outcome) ? '，请核对结果与日志' : '') + (job.result?.changed === false ? '，未发生变更' : '');
     }
     return job.status === 'queued' ? '排队中' : job.status === 'running' ? '执行中（无百分比估算）' : '状态未知';
@@ -438,6 +465,7 @@
   }
   async function submitJob(payload) {
     if (!S.authenticated || !S.profile) throw new Error('请登录并选择配置');
+    if (['add', 'update', 'delete'].includes(payload.op) && !capabilityAllowed('local_tunnel_management')) throw new Error('容器不管理宿主 ingress/服务，请在宿主 CLI 操作');
     if (busy()) throw new Error('已有任务或未确认的提交，请先同步任务状态');
     if (!['health','cdn-test'].includes(payload.op) && !writeReady()) throw new Error('配置或状态未就绪，请先刷新路由并检查环境');
     S.submitting = true; updateControls();
@@ -485,7 +513,7 @@
       $('#log-omitted').hidden = !S.omitted; $('#log-omitted').textContent = `已省略 ${S.omitted} 行旧日志（后端保留窗口 / 前端日志上限）。`;
       $('#job-detail-meta').textContent = `${job.id} · ${job.op} · 配置 ${profileName(job.profile)} · 创建 ${timeText(job.created)} · ${Number.isFinite(job.elapsed) ? job.elapsed.toFixed(1) + 's' : '耗时未提供'}${job.ended ? ' · 结束 ' + timeText(job.ended) : ''}`;
       $('#job-detail-notice').textContent = jobStatus(job) + (storeError ? `；任务记录存储异常：${storeError}，刷新后恢复可能不完整` : '');
-      $('#job-detail-notice').className = `notice ${job.status === 'error' || job.result?.ok === false ? 'error' : storeError || job.status === 'interrupted' ? 'warning' : ''}`;
+      $('#job-detail-notice').className = `notice ${job.status === 'error' || job.result?.ok === false ? 'error' : storeError || job.status === 'interrupted' || job.result?.partial === true || job.result?.scope === 'container-network' ? 'warning' : ''}`;
       $('#job-result').innerHTML = job.result ? `<h3>执行结果</h3>${safeRows(job.result)}` : '';
       if (job.op === 'health' && job.profile === S.profile) $('#diag-result').textContent = jobStatus(job);
       renderJobs();

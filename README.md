@@ -31,6 +31,12 @@ CNAME 链解决入口地址选择，不会把请求 Host/SNI 换成候选域名�
 
 示例中的 `example.net` / `example.org` 和 `<YOUR_…>` 均是占位符，不是可用基础设施。
 
+## Docker 快速开始
+
+只需容器控制台时，见 [Docker 最短启动与配置挂载](docs/DOCKER.md#最短启动空配置)。Compose 将状态存入 `/data` named volume，`./config` 只读挂载，默认仅发布 `127.0.0.1:8642`；首次成功启动的登录密钥从 `docker compose logs cf-tunnel-accel` 获取。空配置可启动查看缺失项，不代表云端已就绪。
+
+Docker 支持已有配置的云端 DNS/SaaS、CDN 与容器网络后端检查，**不管理宿主 ingress/服务，也不部署外部 cloudflared connector**；新增、修改后端、删除和服务映射禁用。健康检查为有限容器网络范围，不是完整路由管理或端到端验收。原生安装流程如下。
+
 ## 安装：优先普通用户
 
 取得完整源码包后，在包根目录执行；不要只复制扩展名为空的 CLI 文件。
@@ -170,10 +176,13 @@ cf-tunnel-accel cdn set edge.example.net # 手动更改入口，API 确认失败
 
 后台任务记录可保留最近结果；重启后未确认任务标记为 `interrupted`，**不会自动重放**。失败/中断不代表 DNS、SaaS 或本地配置未改变。UI 没有 Token 管理、Cloudflare 开户/onboarding 向导或跨云资源事务。
 
+登录支持可选的进程环境 `CF_TUNNEL_ACCEL_UI_TOKEN` 或只读外部 `--token-file` / `CF_TUNNEL_ACCEL_UI_TOKEN_FILE`；不从 Cloudflare env 文件读取 UI 密钥。默认托管随机密钥只在首次成功启动时打印一次。验证规则、来源冲突、关闭打印与轮换见 [UI 自定义登录密钥](ui/README.md#登录密钥)。
+
 默认监听 `127.0.0.1:8642`。远程优先 SSH 转发，或在受信 TLS 代理之后部署；非回环需显式 `--allow-remote-http`，该参数本身不提供 TLS。访问、任务与审计为管理员级控制面，不是多租户权限系统。
 
 ## 文档与验证边界
 
+- [Docker 快速开始、密钥与能力边界](docs/DOCKER.md)
 - [部署、配置优先级和多 profile](docs/DEPLOYMENT.md)
 - [UI 六页、访问与服务部署](ui/README.md)
 - [维护、旧 root 迁移、备份和回滚](docs/MAINTENANCE.md)

@@ -134,6 +134,9 @@ def load_profiles(
                         env[key] = value
                 # A file cannot redirect the CLI to a different env file.
                 env["CF_TUNNEL_ACCEL_ENV_FILE"] = entry["env_file"]
+            # Container entrypoint is a process-level boundary, not a profile preference.
+            if baseline.get('CF_TUNNEL_ACCEL_RUNTIME') == 'container':
+                env['CF_TUNNEL_ACCEL_RUNTIME'] = 'container'
             environments.append(env)
         for entry, env in zip(entries, environments):
             os.environ.clear()

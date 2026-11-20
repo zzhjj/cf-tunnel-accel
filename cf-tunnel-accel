@@ -65,7 +65,44 @@ except (OSError, ValueError) as exc:
 _ENV = _SETTINGS['env']
 CONFIG_DIR = _SETTINGS['config_dir']
 ENV_FILE = _SETTINGS['env_file']
-SCRIPT_VERSION = '2.1.0'
+SCRIPT_VERSION = '2.2.0'
+# Runtime is deliberately taken from the immutable settings snapshot.  Do not
+# consult os.environ after import: a profile must not change halfway through a
+# request or while the UI is dispatching a job.
+RUNTIME_MODE = str(_ENV.get('CF_TUNNEL_ACCEL_RUNTIME', 'host') or 'host').strip().lower()
+_RUNTIME_MODE_ERROR = '' if RUNTIME_MODE in ('host', 'container') else (
+    "CF_TUNNEL_ACCEL_RUNTIME 必须是 host 或 container，实际值: " + RUNTIME_MODE
+)
+
+def runtime_capabilities() -> dict:
+    """Return the management boundary of this process's runtime view."""
+    _require_valid_runtime()
+    if RUNTIME_MODE == 'container':
+        return {
+            'runtime': 'container',
+            'local_tunnel_management': False,
+            'service_discovery': False,
+            'health_scope': 'container-network',
+        }
+    return {
+        'runtime': 'host',
+        'local_tunnel_management': True,
+        'service_discovery': True,
+        'health_scope': 'host',
+    }
+
+def _require_valid_runtime() -> None:
+    if _RUNTIME_MODE_ERROR:
+        raise CFError(_RUNTIME_MODE_ERROR)
+
+def _require_host_runtime(action: str) -> None:
+    _require_valid_runtime()
+    if RUNTIME_MODE == 'container':
+        raise CFError(
+            f'容器运行模式不管理宿主机 Tunnel：{action} 不可用；'
+            '请在 host 模式执行本地隧道/定时任务操作'
+        )
+
 TOKEN_FILE = _SETTINGS['token_file']
 TOKEN_SOURCE = _SETTINGS['token_source']
 LOCK_PATH = _SETTINGS['lock']
@@ -172,6 +209,11 @@ class CFError(RuntimeError):
 def configuration_status() -> dict:
     """本地可解释就绪状态：不联网，不展示凭据，不修改文件。"""
     missing = []
+    warnings = []
+    if _RUNTIME_MODE_ERROR:
+        missing.append(_RUNTIME_MODE_ERROR)
+    if RUNTIME_MODE == 'container':
+        warnings.append('容器视角：宿主机 cloudflared/systemd 未管理，健康结论为 container-network 部分范围')
     if _CONFIG_ERROR:
         missing.append(_CONFIG_ERROR)
     for name, value in (('TUNNEL_ID', TUNNEL_ID), ('AUX_ZONE', AUX_ZONE_NAME)):
@@ -183,10 +225,17 @@ def configuration_status() -> dict:
         missing.append(f'隧道配置不存在: {CONFIG_PATH}')
     dependencies = {}
     for name in ('cloudflared', 'curl', 'dig', 'systemctl', 'ss', 'ping'):
-        path = shutil.which(CLOUDFLARED_BIN if name == 'cloudflared' else name)
-        dependencies[name] = {'present': bool(path), 'path': path, 'required': name in ('cloudflared', 'curl')}
+        # These are host-service dependencies, not container requirements.
+        path = (None if RUNTIME_MODE == 'container' and name in ('cloudflared', 'systemctl')
+                else shutil.which(CLOUDFLARED_BIN if name == 'cloudflared' else name))
+        dependencies[name] = {'present': bool(path), 'path': path,
+                              'required': name == 'curl' or name == 'cloudflared' and RUNTIME_MODE != 'container'}
     return {
-        'ready': not missing, 'missing': missing,
+        'ready': not missing, 'missing': missing, 'warnings': warnings,
+        'capabilities': (runtime_capabilities() if not _RUNTIME_MODE_ERROR else {
+            'runtime': RUNTIME_MODE, 'local_tunnel_management': False,
+            'service_discovery': False, 'health_scope': 'invalid',
+        }),
         'credentials': {'configured': bool(CF_API_TOKEN), 'source': TOKEN_SOURCE},
         'config': {'env_file': str(ENV_FILE), 'config_dir': str(CONFIG_DIR),
                    'tunnel_config': str(CONFIG_PATH), 'tunnel_id': TUNNEL_ID,
@@ -214,6 +263,10 @@ def resolve_aux_zone_id() -> str:
 
 def prepare_configuration(require_local: bool = False) -> dict:
     """首次写入前完成本地检查及辅助 zone 的权威账户/名称核验。"""
+    # This must precede config reads, dependency discovery, and all API calls.
+    _require_valid_runtime()
+    if require_local:
+        _require_host_runtime('本地配置写入/隧道重启')
     global AUX_ZONE_ID
     errors = []
     if _CONFIG_ERROR:
@@ -912,6 +965,8 @@ def print_env() -> int:
         token_src = "未设置 ✗（先配置 Token，见 --help）"
     items = [
         ("脚本路径", str(Path(__file__).resolve())),
+        ("运行模式", RUNTIME_MODE),
+        ("运行能力", json.dumps(runtime_capabilities(), ensure_ascii=False)),
         ("API Token", token_src),
         ("配置覆盖文件", str(ENV_FILE) + ("（存在）" if ENV_FILE.exists() else "（不存在）")),
         ("ACCOUNT_ID", ACCOUNT_ID),
@@ -1500,6 +1555,7 @@ UI_UNIT = "cf-tunnel-ui.service"
 
 def launch_ui(extra_args: Optional[List[str]] = None) -> int:
     """拉起 Web 控制台：优先用已安装的 systemd 服务，否则前台跑 ui/server.py。"""
+    _require_valid_runtime()
     if not UI_SERVER.is_file():
         cprint(f"没有找到 Web 控制台: {UI_SERVER}", "red")
         cprint(
@@ -1508,7 +1564,11 @@ def launch_ui(extra_args: Optional[List[str]] = None) -> int:
         )
         return 1
     try:
-        active = run(['systemctl', 'is-active', UI_UNIT], check=False, timeout=10) if shutil.which('systemctl') else None
+        # A container must not inspect or manage host systemd, even when the
+        # binary happens to be mounted into the image.
+        active = (None if RUNTIME_MODE == 'container' else
+                  (run(['systemctl', 'is-active', UI_UNIT], check=False, timeout=10)
+                   if shutil.which('systemctl') else None))
     except CFError:
         active = None
     if active is not None and (active.stdout or '').strip() == 'active' and not extra_args:
@@ -1597,6 +1657,7 @@ def ingress_origin_block(no_tls_verify: bool) -> List[str]:
 def upsert_tunnel_hostname(
     hostname: str, service_url: str, no_tls_verify: Optional[bool] = None
  ) -> bool:
+    _require_host_runtime('更新 Tunnel ingress')
     import cfa_ingress
     if not CONFIG_PATH.is_file():
         raise CFError(config_missing_hint())
@@ -1615,6 +1676,7 @@ def upsert_tunnel_hostname(
 
 
 def remove_tunnel_hostname(hostname: str) -> bool:
+    _require_host_runtime('删除 Tunnel ingress')
     import cfa_ingress
     if hostname in (FALLBACK_ORIGIN, CUSTOM_ORIGIN):
         raise CFError('系统 origin 入口不允许删除')
@@ -1718,6 +1780,7 @@ def _validate_and_restart_once() -> None:
 
 def validate_and_restart_tunnel(rollback_text: Optional[str] = None) -> None:
     """校验并重启；新配置失败时自动恢复调用前的配置。"""
+    _require_host_runtime('校验并重启 Tunnel')
     try:
         _validate_and_restart_once()
     except Exception as exc:
@@ -2594,24 +2657,32 @@ def _systemd_active() -> Tuple[bool, str]:
 
 def show_status() -> None:
     """输出不修改任何资源的简要运行状态，适合人工或脚本快速查看。"""
+    _require_valid_runtime()
     cprint("\n====== cf-tunnel-accel 状态 ======", "bold")
-    active, state = _systemd_active()
-    cprint(
-        f"Tunnel service: {SERVICE_NAME} -> {state}",
-        "green" if active else "red",
-    )
+    if RUNTIME_MODE == 'container':
+        cprint('运行视角: container-network（宿主机 Tunnel 服务为未管理/未知）', 'cyan')
+        cprint(f"Tunnel service: {SERVICE_NAME} -> unmanaged/unknown", 'cyan')
+    else:
+        active, state = _systemd_active()
+        cprint(
+            f"Tunnel service: {SERVICE_NAME} -> {state}",
+            "green" if active else "red",
+        )
     if CONFIG_PATH.exists():
         routes = parse_ingress_hostnames(CONFIG_PATH.read_text(encoding="utf-8"))
         cprint(f"Tunnel config: {CONFIG_PATH}（{len(routes)} 条 hostname 规则）", "cyan")
-        check = run(
-            [CLOUDFLARED_BIN, "--config", str(CONFIG_PATH), "tunnel", "ingress", "validate"],
-            check=False,
-            timeout=30,
-        )
-        cprint(
-            f"Config validate: {'OK' if check.returncode == 0 else 'FAILED'}",
-            "green" if check.returncode == 0 else "red",
-        )
+        if RUNTIME_MODE == 'container':
+            cprint('Config validate: skipped（容器不执行 cloudflared，本地 connector 未管理）', 'cyan')
+        else:
+            check = run(
+                [CLOUDFLARED_BIN, "--config", str(CONFIG_PATH), "tunnel", "ingress", "validate"],
+                check=False,
+                timeout=30,
+            )
+            cprint(
+                f"Config validate: {'OK' if check.returncode == 0 else 'FAILED'}",
+                "green" if check.returncode == 0 else "red",
+            )
     else:
         for line in config_missing_hint().splitlines():
             cprint(line, "red")
@@ -2631,6 +2702,10 @@ def show_status() -> None:
             cprint(f"  - {item.get('hostname')}: {item.get('status')} / ssl={ssl_status}")
     except Exception as exc:
         cprint(f"SaaS custom hostnames: 读取失败: {exc}", "yellow")
+
+    if RUNTIME_MODE == 'container':
+        cprint('最近 Tunnel 错误: skipped（容器视角不读取宿主机 journalctl）', 'cyan')
+        return
 
     journal = run(
         [
@@ -2719,8 +2794,12 @@ def check_auxiliary_chain() -> int:
 
 def health_check(hostname: Optional[str] = None, include_https: bool = False) -> bool:
     """检查 Tunnel 服务、配置、每条本地后端及 SaaS/DNS 链路。"""
+    _require_valid_runtime()
     cprint("\n====== Tunnel 全链路健康检查 ======", "bold")
     failures = 0
+    partial_scope = RUNTIME_MODE == 'container'
+    if partial_scope:
+        cprint('健康范围: container-network；宿主机 cloudflared/systemd 校验跳过（未管理/未知）', 'cyan')
     if not CONFIG_PATH.exists():
         cprint(f"FAIL config 不存在: {CONFIG_PATH}", "red")
         for line in config_missing_hint().splitlines()[1:]:
@@ -2735,26 +2814,30 @@ def health_check(hostname: Optional[str] = None, include_https: bool = False) ->
             cprint(f"FAIL 配置中找不到 hostname: {hostname}", "red")
             return False
 
-    active, state = _systemd_active()
-    cprint(
-        f"{'PASS' if active else 'FAIL'} systemd {SERVICE_NAME}: {state}",
-        "green" if active else "red",
-    )
-    if not active:
-        failures += 1
+    if partial_scope:
+        cprint(f"INFO systemd {SERVICE_NAME}: unmanaged/unknown", "cyan")
+        cprint('INFO cloudflared ingress validate: skipped in container runtime', 'cyan')
+    else:
+        active, state = _systemd_active()
+        cprint(
+            f"{'PASS' if active else 'FAIL'} systemd {SERVICE_NAME}: {state}",
+            "green" if active else "red",
+        )
+        if not active:
+            failures += 1
 
-    validation = run(
-        [CLOUDFLARED_BIN, "--config", str(CONFIG_PATH), "tunnel", "ingress", "validate"],
-        check=False,
-        timeout=30,
-    )
-    valid = validation.returncode == 0
-    cprint(
-        f"{'PASS' if valid else 'FAIL'} cloudflared ingress validate",
-        "green" if valid else "red",
-    )
-    if not valid:
-        failures += 1
+        validation = run(
+            [CLOUDFLARED_BIN, "--config", str(CONFIG_PATH), "tunnel", "ingress", "validate"],
+            check=False,
+            timeout=30,
+        )
+        valid = validation.returncode == 0
+        cprint(
+            f"{'PASS' if valid else 'FAIL'} cloudflared ingress validate",
+            "green" if valid else "red",
+        )
+        if not valid:
+            failures += 1
 
     # 重启慢/“新配置未生效”的根因常常就在这里：没有 grace-period 时
     # cloudflared 收到 SIGTERM 可能一直不退出，只能等 systemd 的
@@ -2856,7 +2939,7 @@ def health_check(hostname: Optional[str] = None, include_https: bool = False) ->
                 failures += 1
 
     cprint(
-        f"\n健康检查结果: {'PASS' if failures == 0 else f'FAIL ({failures} 项)'}",
+        f"\n健康检查结果{'（container-network 有限范围）' if partial_scope else ''}: {'PASS' if failures == 0 else f'FAIL ({failures} 项)'}",
         "green" if failures == 0 else "red",
     )
     return failures == 0
@@ -2959,6 +3042,7 @@ def interactive_switch() -> None:
 
 def install_cdn_schedule(interval_hours: int = 6) -> None:
     """安装可选的 systemd 定时优选任务。"""
+    _require_host_runtime('安装 CDN 定时任务')
     if not (1 <= interval_hours <= 168):
         raise CFError("定时优选间隔必须是 1 到 168 小时")
     if not ENV_FILE.is_file():
@@ -3017,6 +3101,7 @@ WantedBy=timers.target
 
 
 def remove_cdn_schedule() -> None:
+    _require_host_runtime('移除 CDN 定时任务')
     run(
         ["systemctl", "disable", "--now", AUTO_CDN_TIMER_UNIT.name],
         check=False,
@@ -3031,6 +3116,7 @@ def remove_cdn_schedule() -> None:
 
 
 def show_cdn_schedule() -> None:
+    _require_host_runtime('查看 CDN 定时任务')
     enabled = run(
         ["systemctl", "is-enabled", AUTO_CDN_TIMER_UNIT.name],
         check=False,
@@ -3423,6 +3509,21 @@ def command_requires_lock(argv: List[str]) -> bool:
 
 
 def main(argv: List[str]) -> int:
+    # Validate the immutable runtime snapshot before locks, token checks,
+    # config reads, or any cloud/network operation.
+    try:
+        _require_valid_runtime()
+    except CFError as exc:
+        cprint(f'错误: {exc}', 'red')
+        return 2
+    cmd = argv[1].lower() if len(argv) >= 2 else ''
+    blocked_local = (not cmd or cmd in ('add', 'del', 'delete', 'rm', 'schedule', 'timer', 'auto'))
+    if blocked_local and RUNTIME_MODE == 'container':
+        cprint(
+            '错误: 容器模式支持云端 DNS/SaaS、后端/公网诊断和优选；'
+            '本地 Tunnel 管理及 CDN 定时任务由宿主机执行。', 'red'
+        )
+        return 2
     # 帮助/版本不应触发 API 请求、systemd 锁或网络依赖。
     if len(argv) >= 2 and argv[1].lower() in ("-h", "--help", "help"):
         print_help()

@@ -1,0 +1,38 @@
+# Deny by default: the image context must contain only the runtime allowlist.
+**
+
+# Runtime application files copied by Dockerfile.
+!LICENSE
+!cf-tunnel-accel
+!cfa_config.py
+!cfa_cdn.py
+!cfa_ingress.py
+!ui/
+!ui/server.py
+!ui/profiles.py
+!ui/static/
+!ui/static/app.js
+!ui/static/index.html
+!ui/static/style.css
+!docker/
+!docker/healthcheck.py
+
+# Keep source-control, local state, credentials, tests, and documentation out of context.
+.git/
+.gitignore
+.env
+.env.*
+**/.env
+**/.env.*
+**/state/
+**/tests/
+**/*token*
+**/*secret*
+**/*credential*
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+**/config/
+**/data/

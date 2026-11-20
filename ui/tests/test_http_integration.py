@@ -365,7 +365,9 @@ class HTTPIntegrationTests(unittest.TestCase):
                   'credentials': {'configured': False, 'source': None}, 'dependencies': {}}
         self.profiles['beta'].configuration_status = mock.Mock(return_value=report)
         self.assertEqual(self.request('GET', '/api/environment?profile=beta')[2],
-                         {'ok': True, 'environment': report})
+                         {'ok': True, 'environment': {**report, 'capabilities': {
+                             'runtime': 'host', 'local_tunnel_management': True,
+                             'service_discovery': True, 'health_scope': 'host'}}})
         self.profiles['beta'].configuration_status.assert_called_once_with()
         self.assertIsInstance(self.request('GET', '/api/environment?profile=alpha')[2]
                               ['environment']['ready'], bool)
@@ -399,6 +401,49 @@ class HTTPIntegrationTests(unittest.TestCase):
         self.assertEqual(rc, 200)
         self.assertEqual(result['services'], [])
         self.assertIn('ss', result['warnings'][0])
+
+
+    def test_anonymous_liveness_has_no_configuration_or_credential_data(self):
+        code, _, payload = self.request('GET', '/api/health', authenticated=False)
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {'ok': True, 'status': 'ok'})
+        self.assertEqual(self.request('POST', '/api/health', {}, authenticated=False)[0], 405)
+
+    def test_container_local_operations_are_rejected_before_admission(self):
+        self.login()
+        accel = self.profiles['alpha']
+        accel._container_runtime = True
+        before = accel.config
+        for op in ('add', 'update', 'delete'):
+            code, _, payload = self.request('POST', '/api/jobs?profile=alpha', {
+                'op': op, 'hostname': 'alpha.example.org', 'service': 'http://127.0.0.1:8080',
+                'confirm': 'alpha.example.org'})
+            self.assertEqual(code, 409)
+            self.assertEqual(payload['code'], 'local_tunnel_unmanaged')
+        self.assertEqual(self.request('GET', '/api/jobs')[2]['jobs'], [])
+        self.assertEqual(accel.calls, [])
+        self.assertEqual(accel.config, before)
+        with self.assertRaises(mod.LocalTunnelUnmanaged):
+            self.app.runner.submit('delete', {'hostname': 'alpha.example.org'}, 'test', profile='alpha')
+
+    def test_container_state_is_unmanaged_and_diagnostic_result_is_partial(self):
+        self.login()
+        accel = self.profiles['alpha']
+        accel._container_runtime = True
+        with mock.patch.object(mod.subprocess, 'run', side_effect=AssertionError('host command')):
+            state = self.request('GET', '/api/state?profile=alpha&fresh=1')[2]
+            services = self.request('GET', '/api/services?profile=alpha')[2]
+        self.assertIsNone(state['service']['active'])
+        self.assertEqual(state['service']['state'], 'unmanaged')
+        self.assertFalse(state['capabilities']['local_tunnel_management'])
+        self.assertNotIn('service', state['errors'])
+        self.assertEqual(services['services'], [])
+        self.assertTrue(services['warnings'])
+        submitted = self.submit('health')
+        self.assertEqual(submitted[0], 200)
+        result = self.wait_job(submitted[2]['job']['id'])['result']
+        self.assertTrue(result['partial'])
+        self.assertEqual(result['scope'], 'container-network')
 
 
 if __name__ == '__main__':
