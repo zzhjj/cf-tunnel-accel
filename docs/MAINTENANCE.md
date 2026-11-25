@@ -4,11 +4,36 @@
 
 ## 变更前：先固定目标与备份
 
-1. 本地确认包版本、启动器指向、执行用户、HOME/XDG、所选 env、Tunnel config、systemd service，以及 profile 注册表。`env` 是本地来源检查；输出仍含账户/zone/path 元数据，不原样粘贴公共 issue。
+1. 本地确认包版本、启动器指向、执行用户、HOME/XDG、所选 env、Tunnel config、systemd service，以及 profile 注册表。2.2.1 用 `cf-tunnel-accel --profile alpha env` 明确核对注册 profile；registry 不在默认配置目录时加命令前的 `--profiles PATH`。`env` 是本地来源检查；输出仍含账户/zone/path 元数据，不原样粘贴公共 issue。
 2. 等待写任务完成，暂停新的管理请求和相关自动优选 timer。必要时停止 UI，但不要把停止 UI 当作撤销 Cloudflare 变更。
 3. 备份**成套包**：`cf-tunnel-accel`、`cfa_config.py`、`cfa_ingress.py`、`cfa_cdn.py`、完整 UI/静态资源与启动器；同时备份 env、registry、API/UI Token、Tunnel 配置/JSON 凭据、缓存、任务记录、审计、相关 unit/drop-in。
 4. 备份目录限制为 0700，凭据/配置文件 0600，保留所有权；按运维策略加密并验证恢复方法。备份、真实 env、凭据和日志不进入仓库或共享测试 artifact。unit 也可能含敏感环境变量。
 5. 私下记录云端 DNS/SaaS 的当前归属及入口目标，用于逐项恢复。备份文件不等于云端资源快照，不公开账户、zone、Tunnel 标识或实际服务详情。
+
+## 2.2.1：CLI profile 选择与新增预检
+
+升级后 CLI 支持命令前的全局 `--profile ID` / `--profiles PATH`，也支持 `--profile=ID` / `--profiles=PATH`。选择先于设置/凭据读取，显式命令行优先于进程环境，再优先于默认本机 env 的 `CF_TUNNEL_ACCEL_PROFILE` / `CF_TUNNEL_ACCEL_PROFILES` marker；进程指定 `CF_TUNNEL_ACCEL_ENV_FILE` 时从该文件读取 marker。registry 未指定时为 `config_dir/profiles.json`。仅指定 registry 路径而无 ID/marker 会报错，不选首个 profile。
+
+```bash
+cf-tunnel-accel --profile alpha env
+cf-tunnel-accel --profiles /etc/cf-tunnel-accel/profiles.json --profile beta env
+cf-tunnel-accel --profile=beta --profiles=/etc/cf-tunnel-accel/profiles.json env
+```
+
+先确认注册表和各 profile 的私有 env 已就绪，再在默认本机 env 加入常用选择：
+
+```ini
+CF_TUNNEL_ACCEL_PROFILE=alpha
+# 可选：registry 不在默认配置目录时指定
+CF_TUNNEL_ACCEL_PROFILES=/etc/cf-tunnel-accel/profiles.json
+```
+
+**marker 不入 Git**，实际 registry、env 与凭据同样仅保存在本机；公开文档只用 `alpha` / `beta`、`example.net` 等占位示例。显式 `--profile beta` 覆盖 `alpha` marker。无 marker/全局 flags 时，裸 CLI 仍使用默认 env，即使 UI 已加载多 profile。UI 保持 `cf-tunnel-accel ui --profiles /etc/cf-tunnel-accel/profiles.json`（参数在 `ui` 后）及原选择器，与终端 CLI 不联动。未知 ID、重复 flags、参数缺失、坏 registry/所选 env 均报错，不静默读取其它 profile 的配置/凭据。完整覆盖规则见[部署说明](DEPLOYMENT.md#多-profile-注册表)。
+
+新增失败先区分两个阶段，避免反复进入向导或盲目重试：
+
+- **本地配置阶段**：`main add` / 无参数入口，以及直接交互新增，都在锁、网络和第一次输入前检查 `AUX_ZONE`、入口/origin、Tunnel UUID 与本地 config。错误给出实际 env、当前 profile 和 `init` / `--profile alpha env` 恢复方向。新用户先准备 Token、已有 Tunnel 配置/凭据，再 `init` 只填 SaaS `AUX_ZONE` 并接受默认服务；origin/cdn 从辅助 zone 派生。业务 zone 管理业务 DNS，SaaS 辅助 zone 承载 origin/入口，二者不是同一个配置角色。
+- **入口目标阶段**：新增在任何 DNS 写之前严格预检 preferred target，先于 origin/SaaS/ingress 更改。已有有效 CNAME 时沿用，不要求默认目标；确认不存在时需要明确的 `PREFERRED_TARGET` 或先执行 `cdn set <目标域名>`。读取失败直接停止，不 fallback、不把现有目标改回默认值。此预检失败尚未写入；后续阶段失败仍可能留下部分变更。`cdn set` 本身会写 DNS，应单独核对后执行。
 
 ## 旧 root 安装迁移：必须先显式配置
 
@@ -28,6 +53,8 @@
 在独立检出目录按 [CONTRIBUTING](../CONTRIBUTING.md) 做语法、测试和文档检查。Python 3.9+ 是兼容目标，实际执行过的版本另行记录，不能用语法检查代替运行兼容性；CI 定义见仓库 workflow，不在公共文档维护过期测试数。
 
 发布说明应列出候选版本/提交、改动范围、实测命令和版本、未测项、配置变化、已知限制与恢复步骤。没有真实 Cloudflare 创建/证书/DNS 验收时，明确写“仅本地离线验证”；测试通过不等于生产或所有地区可用。
+
+公共仓库已采用干净历史，维护与发布只基于当前公开基线向前推进；不要回推旧 history、合并旧个人部署分支，或把历史中的个人数据重新带入文档/提交。旧部署备份留在私有存储，迁移只写本机配置，不作为公共仓库回滚来源。根目录本机 `/profiles.json` 由 `.gitignore` 忽略，[profiles.example.json](profiles.example.json) 仍是可跟踪的通用文档模板；忽略规则不负责清除已经跟踪的数据，发布前仍需检查实际 diff 和本地文档链接。
 
 开发验证不得读取个人 env/Token、操作现有 systemd、启动自动优选或调用真实 Cloudflare。安装器测试应使用临时 HOME/XDG、临时前缀、stub 和 `--no-deps`；网络/系统行为必须拦截，不对真实安装执行试装。
 
@@ -62,7 +89,10 @@ CDN 手动切换保存原始记录，API 确认失败时尝试恢复；自动优
 | 现象 | 核对与处理 |
 |---|---|
 | CLI 导入失败或 UI 功能不匹配 | 包是否缺 `cfa_config.py` / `cfa_ingress.py` / `cfa_cdn.py`；CLI/UI/静态资源是否同一版本 |
-| 配置缺失、选到错误账户 | HOME/XDG、启动器固化 env、显式 `ENV_FILE`、父进程覆盖值、registry；不要靠 root 旧默认常量 |
+| 配置缺失、选到错误账户 | HOME/XDG、启动器固化 env、显式 `ENV_FILE`、父进程覆盖值；用命令前的 `--profile alpha env` 核对 registry 和实际 env，不靠旧默认常量 |
+| UI 有 profile，裸 CLI 却未加载 | UI 选择器不修改终端；CLI 显式 `--profile alpha env` 或在默认本机 env 设置 `CF_TUNNEL_ACCEL_PROFILE=alpha` marker；仅有 registry 不自动选首个 |
+| `add` / 无参数入口未提示输入就报错 | 新的本地预检先于锁/联网/输入；按错误中的实际 env/profile 修复 AUX_ZONE、入口/origin、Tunnel config/UUID，先 `init` 或选择已有 profile |
+| 新增提示优选入口未初始化或读取失败 | 确认已有 CNAME 或明确 `PREFERRED_TARGET`；缺目标时先配置或显式 `cdn set`，读错先处理权限/API，不靠默认目标 fallback |
 | Token 文件已改但仍用旧凭据 | 来源组优先级和父进程内联 Token；修改配置后重启 UI 以重新加载 profile |
 | zone/SaaS 读失败或视图只显示一部分 | 权限范围、账户过滤、active zone 与 SaaS 启用状态；未知/失败不是“没有资源” |
 | 自动 best 不切 | 是否设置真实 `PROBE_HOSTNAME`，≥2 健康样本且 ≥80%，证书/HTTP/计时是否有效，以及改善阈值；`--force` 不能绕过有效性 |

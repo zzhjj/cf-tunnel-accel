@@ -49,7 +49,7 @@ export PATH="$HOME/.local/bin:$PATH"
 cf-tunnel-accel --version
 ```
 
-普通用户安装不需要 root，只写入 XDG 目录。默认会尝试准备缺少的可选工具；已有 `cloudflared` 时可加 `--no-deps`，它只跳过依赖安装/下载，不跳过 Python 3.9+ 检查。没有 cloudflared 仍可安装并查看本地环境，但不能据此认为 Tunnel 功能已就绪。安装前可加 `--dry-run` 查看计划；安装器不使用系统包管理器。
+普通用户安装不需要 root，只写入用户目录；缺少 curl/dig 时只提示补齐，不调用系统包管理器，缺少 cloudflared 时可尝试下载官方 release。root 默认安装可能通过系统包管理器准备可选工具。已有依赖时可加 `--no-deps`，它只跳过依赖安装/下载，不跳过 Python 3.9+ 检查。没有 cloudflared 仍可安装并查看本地环境，但不代表 Tunnel 功能已就绪。安装前可加 `--dry-run` 查看计划。
 
 | 选项 | 实际作用 |
 |---|---|
@@ -83,7 +83,7 @@ sudo bash ./install.sh --no-deps --source-dir "$PWD" \
 
 ## 首次配置
 
-默认 env 是 `${XDG_CONFIG_HOME:-$HOME/.config}/cf-tunnel-accel/env`。普通配置优先级：**进程环境 > 选定 env 文件 > HOME/XDG 派生默认值**。用 `CF_TUNNEL_ACCEL_ENV_FILE` 选择其它文件前，先确认文件存在且可读；当前普通 CLI 对缺失 env 可继续采用环境/默认配置，不应把未报错当成选中正确配置。多 profile 注册表引用的 env 缺失则会拒绝启动。
+默认配置目录是 `CF_TUNNEL_ACCEL_CONFIG_DIR`，未设置时为 `${XDG_CONFIG_HOME:-$HOME/.config}/cf-tunnel-accel`；默认 env 是该目录的 `env`。未选择注册 profile 时，普通配置优先级为 **进程环境 > env 文件 > HOME/XDG 派生默认值**。用 `CF_TUNNEL_ACCEL_ENV_FILE` 选择其它文件前，先确认文件存在且可读；普通 CLI 对缺失 env 可继续采用环境/默认配置，不应把未报错当成选中正确配置。注册表中选定 profile 的 env 缺失则报错，不退回默认配置。
 
 ### 最短路径（交互，只填辅助域）
 
@@ -91,7 +91,9 @@ sudo bash ./install.sh --no-deps --source-dir "$PWD" \
 
 1. 已存在的 `~/.cloudflared/config.yml`（顶层含 `tunnel` UUID）；
 2. 一个 Cloudflare API Token；
-3. 一个启用 Cloudflare for SaaS 的辅助域名。
+3. 一个启用 Cloudflare for SaaS 的辅助 zone（`AUX_ZONE`）。
+
+**业务 zone ≠ SaaS 辅助 zone**：业务 zone 管理 `app.example.net` 等待接入的业务域名；辅助 zone 承载 SaaS custom hostname、origin 与优选入口。`init` 中填写的是辅助 zone，不是随后 `add` 的业务 hostname。下面用 `example.org` 作为辅助 zone，自动派生 `origin.example.org` 和 `cdn.example.org`；两者不必另填。
 
 ```bash
 APP_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/cf-tunnel-accel"
@@ -105,7 +107,7 @@ cf-tunnel-accel env
 cf-tunnel-accel ui
 ```
 
-`init` 会使用默认 Tunnel 配置和 Token 路径，从配置顶层自动读取 Tunnel UUID，并给服务名提供 `cloudflared.service` 默认值。**账户 ID、Zone ID、优选目标和探测域名都不是首次配置的必填项**：账户 ID 省略时按 Token 可见范围解析，Zone ID 首次联网时按辅助域名解析，优选可在管理台之后再设置。
+`init` 会使用默认 Tunnel 配置和 Token 路径，从配置顶层自动读取 Tunnel UUID，并给服务名提供 `cloudflared.service` 默认值。**账户 ID、Zone ID、优选目标和探测域名都不是 `init` 的必填项**：账户 ID 省略时按 Token 可见范围解析，Zone ID 首次联网时按辅助域名解析。首次新增前，若优选入口还没有 CNAME，需先明确设置 `CF_TUNNEL_ACCEL_PREFERRED_TARGET` 或执行 `cdn set edge.example.net`；已有有效 CNAME 则沿用它，不要求另填默认目标。候选域名仅为占位示例，实际目标需自行验证。
 
 如果配置或服务不在默认位置，只覆盖对应一项：
 
@@ -125,7 +127,34 @@ env 是 `KEY=VALUE` 数据，不是 shell 脚本：不执行、不展开 `$HOME`
 
 **旧 root 部署迁移：先配置，再升级。** 如果旧安装依赖代码里硬编码的账户、辅助 zone 或 Tunnel，先在本机受保护的 env 中显式记录自己的 `ACCOUNT_ID`、`AUX_ZONE`、`AUX_ZONE_ID`、`TUNNEL_ID`、`CONFIG`、`SERVICE`、Token 来源及 origin/优选入口设置，核对现有云端归属，再安装新包。不要期待新的 HOME 默认值重现旧机器；不把实际值贴到公共文档、日志或 issue。详见[升级与回滚](docs/MAINTENANCE.md)。
 
+### CLI 选择已有 profile（2.2.1）
+
+CLI 新增全局前缀 `--profile ID` / `--profiles PATH`，也支持 `--profile=ID` / `--profiles=PATH`。**全局 flags 必须放在命令前**，在设置和凭据读取前完成选择；CLI 与 UI 复用同一注册表及 profile 凭据来源组规则。
+
+```bash
+cf-tunnel-accel --profile alpha env
+cf-tunnel-accel --profile alpha add app.example.net http://127.0.0.1:8080
+cf-tunnel-accel --profiles /etc/cf-tunnel-accel/profiles.json --profile beta env
+cf-tunnel-accel --profile=beta --profiles=/etc/cf-tunnel-accel/profiles.json env
+```
+
+无 flags 时也会读取默认本机 env 中的选择 marker（如进程设置了 `CF_TUNNEL_ACCEL_ENV_FILE`，则从该文件读取）。选择优先级为 **命令行 > 进程环境 > 本机 env marker**；registry 未指定时使用配置目录下的 `profiles.json`。已注册 profile 的用户，可在本机 env 中保存：
+
+```ini
+CF_TUNNEL_ACCEL_PROFILE=alpha
+# 可选：注册表不在默认配置目录时指定绝对路径
+CF_TUNNEL_ACCEL_PROFILES=/etc/cf-tunnel-accel/profiles.json
+```
+
+marker、实际 registry 和 profile env 都是本机私有配置，**不入 Git**；[profiles 模板](docs/profiles.example.json)只提供 `alpha` / `beta` 占位示例。显式 `--profile beta` 覆盖本机 `alpha` marker。仅指定 `--profiles` 而没有 ID/marker 会报错，不自动选第一个；没有任何选择 marker/flags 时，即使 UI 已注册 profile、配置目录已有 registry，裸 CLI 仍使用默认 env。
+
+UI 仍用 `cf-tunnel-accel ui --profiles /etc/cf-tunnel-accel/profiles.json`（注意参数在 `ui` 后），这是 UI 参数，不是 CLI 全局选择；UI 选择器和独立终端的 CLI profile 互不联动。完整规则见[多 profile 注册表](docs/DEPLOYMENT.md#多-profile-注册表)。
+
 ## 常用操作
+
+缺少或无效的 `AUX_ZONE`、优选入口、origin、Tunnel UUID/本地配置时，`add` 与无参数入口会在**获取锁、联网和第一次输入前**报本地配置错误；直接调用交互新增向导也先做同样预检。错误给出实际 env 路径、当前 profile，以及 `init` / `--profile alpha env` 的恢复方向。新用户先 `init`，已有 UI profile 的用户先明确选择并用 `env` 核对，不靠反复进入向导补配置。
+
+新增流程还会在**任何 DNS 写入前**严格读取优选入口：沿用已有有效 CNAME，仅在确认未配置时使用明确的 `PREFERRED_TARGET`；目标缺失或读取失败就停止，读取失败不 fallback 到默认目标。此预检也先于 origin、SaaS 和 ingress 更改，但不代表后续跨服务操作具有事务性。
 
 以下 `domains`、`list`、`status`、`health` 会访问网络/Cloudflare；写命令还会变更选定资源。执行前先用 `env` 在本地核对目标。
 

@@ -56,6 +56,31 @@ class ScopeContract(unittest.TestCase):
                     CF_TUNNEL_ACCEL_AUX_ZONE_ID=AUX_ID,
                     CF_TUNNEL_ACCEL_SERVICE='cloudflared-scope-test.service')
 
+    def test_add_preferred_preflight_stops_before_any_resource_mutation(self):
+        self.config.write_text(CONFIG)
+        cli = load_cli(self.configured_env())
+        for failure in ('missing', 'lookup-failed'):
+            with mock.patch.object(cli, 'prepare_configuration'), \
+                    mock.patch.object(cli, 'refresh_zone_cache'), \
+                    mock.patch.object(cli, 'resolve_zone', return_value=('example.org', OTHER_ID)), \
+                    mock.patch.object(cli, 'check_local_backend'), \
+                    mock.patch.object(cli, 'get_current_preferred_target',
+                                      return_value='', side_effect=cli.CFError('fixture lookup failed') if failure == 'lookup-failed' else None), \
+                    mock.patch.object(cli, 'ensure_origin_dns') as origin, \
+                    mock.patch.object(cli, 'upsert_dns') as dns, \
+                    mock.patch.object(cli, 'upsert_tunnel_hostname') as ingress, \
+                    mock.patch.object(cli, 'create_or_get_custom_hostname') as saas, \
+                    mock.patch.object(cli, 'validate_and_restart_tunnel') as restart:
+                with self.assertRaises(cli.CFError):
+                    cli.add_accelerated_service('app.example.org', 'http://127.0.0.1:18888')
+                origin.assert_not_called()
+                dns.assert_not_called()
+                ingress.assert_not_called()
+                saas.assert_not_called()
+                restart.assert_not_called()
+            self.assertEqual(self.config.read_text(), CONFIG)
+
+
     def test_list_zones_filters_foreign_and_unknown_accounts_on_every_page(self):
         cli = load_cli(self.scoped_env)
         own = zone(AUX_ID, AUX_NAME, ACCOUNT_A)
