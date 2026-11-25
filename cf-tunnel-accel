@@ -50,11 +50,25 @@ from typing import Any, Dict, List, Optional, Tuple
 # 所有配置在导入时固化：profile 无需在线程之间切换进程环境。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cfa_config
+_CLI_ARGV = list(sys.argv)
+_PROFILE_META = {}
+_BOOTSTRAP_ENV = dict(os.environ)
+if __name__ == '__main__':
+    try:
+        _BOOTSTRAP_ENV, _CLI_ARGV, _PROFILE_META = cfa_config.select_cli_profile(_BOOTSTRAP_ENV, _CLI_ARGV)
+    except (OSError, ValueError) as exc:
+        print(f'配置选择失败: {exc}', file=sys.stderr)
+        sys.exit(2)
+
 try:
-    _SETTINGS = cfa_config.resolve_settings(os.environ)
+    _SETTINGS = cfa_config.resolve_settings(_BOOTSTRAP_ENV)
+    _SETTINGS.update(_PROFILE_META)
     _CONFIG_ERROR = ''
 except (OSError, ValueError) as exc:
     _CONFIG_ERROR = str(exc)
+    if __name__ == '__main__' and _PROFILE_META:
+        print(f'profile 配置加载失败 ({_PROFILE_META["profile_id"]}, {_BOOTSTRAP_ENV.get("CF_TUNNEL_ACCEL_ENV_FILE")}): {exc}', file=sys.stderr)
+        sys.exit(2)
     # 错误页仍可打开；此基线不读取宿主默认 env 或凭据。
     _SETTINGS = cfa_config.resolve_settings({
         'HOME': str(Path.home()),
@@ -65,7 +79,7 @@ except (OSError, ValueError) as exc:
 _ENV = _SETTINGS['env']
 CONFIG_DIR = _SETTINGS['config_dir']
 ENV_FILE = _SETTINGS['env_file']
-SCRIPT_VERSION = '2.2.0'
+SCRIPT_VERSION = '2.2.1'
 # Runtime is deliberately taken from the immutable settings snapshot.  Do not
 # consult os.environ after import: a profile must not change halfway through a
 # request or while the UI is dispatching a job.
@@ -261,13 +275,11 @@ def resolve_aux_zone_id() -> str:
 
 
 
-def prepare_configuration(require_local: bool = False) -> dict:
-    """首次写入前完成本地检查及辅助 zone 的权威账户/名称核验。"""
-    # This must precede config reads, dependency discovery, and all API calls.
+def validate_configuration(require_local: bool = False) -> None:
+    """Local-only preflight; reject incomplete setup before prompts, locks, or network."""
     _require_valid_runtime()
     if require_local:
         _require_host_runtime('本地配置写入/隧道重启')
-    global AUX_ZONE_ID
     errors = []
     if _CONFIG_ERROR:
         errors.append(_CONFIG_ERROR)
@@ -287,6 +299,10 @@ def prepare_configuration(require_local: bool = False) -> dict:
         errors.append('缺少有效 Tunnel UUID（设置 TUNNEL_ID 或现有 config 的 tunnel 字段）')
     if not SERVICE_NAME or SERVICE_NAME.startswith('-') or not cfa_config.SERVICE.fullmatch(SERVICE_NAME):
         errors.append('SERVICE 名称不合法')
+    if AUX_ZONE_NAME:
+        for host in (FALLBACK_ORIGIN, PREFERRED_ENTRY, CUSTOM_ORIGIN):
+            if host and not host.endswith('.' + AUX_ZONE_NAME) and host != AUX_ZONE_NAME:
+                errors.append('入口和回退源必须位于所选辅助 zone 内')
     if require_local:
         if not CONFIG_PATH.is_file():
             errors.append(f'隧道配置不存在: {CONFIG_PATH}')
@@ -296,7 +312,16 @@ def prepare_configuration(require_local: bool = False) -> dict:
             if config_tunnel and config_tunnel != TUNNEL_ID:
                 errors.append('TUNNEL_ID 与选定配置中的 tunnel 不一致')
     if errors:
-        raise CFError('配置未就绪，未执行更改:\n' + '\n'.join(errors))
+        profile = _SETTINGS.get('profile_id') or '(未选择，使用默认 env)'
+        raise CFError('配置未就绪，未执行更改:\n' + '\n'.join(errors) +
+                      f'\n当前配置文件: {ENV_FILE}\n当前 profile: {profile}' +
+                      '\n恢复: cf-tunnel-accel init，或 cf-tunnel-accel --profile <ID> env 检查已有配置')
+
+
+def prepare_configuration(require_local: bool = False) -> dict:
+    """Local preflight followed by authoritative auxiliary-zone verification."""
+    global AUX_ZONE_ID
+    validate_configuration(require_local=require_local)
     if AUX_ZONE_ID:
         zone = api_ok(api('GET', f'/zones/{AUX_ZONE_ID}'), '核验辅助 zone').get('result') or {}
     else:
@@ -965,6 +990,7 @@ def print_env() -> int:
         token_src = "未设置 ✗（先配置 Token，见 --help）"
     items = [
         ("脚本路径", str(Path(__file__).resolve())),
+        ('CLI profile', _SETTINGS.get('profile_id') or 'default（未选择注册 profile）'),
         ("运行模式", RUNTIME_MODE),
         ("运行能力", json.dumps(runtime_capabilities(), ensure_ascii=False)),
         ("API Token", token_src),
@@ -1294,13 +1320,21 @@ def apply_custom_origin(custom_hostname: dict, origin: str) -> dict:
     return resp.get("result") or custom_hostname
 
 
+def preferred_target_preflight() -> str:
+    """Resolve the target strictly before any origin/ingress/SaaS mutation."""
+    target = get_current_preferred_target(strict=True) or PREFERRED_TARGET
+    if not target:
+        raise CFError('优选入口尚未初始化：先配置 PREFERRED_TARGET 或执行 cdn set <目标域名>；未执行更改')
+    target = normalize_cdn_target(target)
+    if target in (PREFERRED_ENTRY, FALLBACK_ORIGIN, CUSTOM_ORIGIN):
+        raise CFError('优选目标形成入口循环，未执行更改')
+    return target
+
+
 def ensure_preferred_entry_dns() -> None:
     # origin 由 tunnel 管理，这里确保 cdn 优选入口存在；保留已切换过的目标
     # 读取失败时宁可停止，不能把现有的优选目标静默改回默认值。
-    current = get_current_preferred_target(strict=True)
-    target = current or PREFERRED_TARGET
-    if not target:
-        raise CFError('优选入口尚未初始化，请显式配置 PREFERRED_TARGET 或执行 cdn set <目标域名>')
+    target = preferred_target_preflight()
     upsert_dns(
         AUX_ZONE_ID,
         "CNAME",
@@ -1578,7 +1612,7 @@ def launch_ui(extra_args: Optional[List[str]] = None) -> int:
     cmd = [sys.executable, '-u', str(UI_SERVER), '--module', str(Path(__file__).resolve())] + list(extra_args or [])
     cprint(f"启动 Web 控制台: {' '.join(cmd)}", "green")
     try:
-        return subprocess.call(cmd)
+        return subprocess.call(cmd, env=_BOOTSTRAP_ENV)
     except KeyboardInterrupt:
         return 0
 
@@ -2441,6 +2475,7 @@ def add_accelerated_service(
             "yellow",
         )
 
+    preferred_target_preflight()  # Resolve before even the origin DNS can be created.
     # 1) 基础入口
     ensure_origin_dns()
     ensure_preferred_entry_dns()
@@ -3009,6 +3044,7 @@ def check_token() -> None:
 
 
 def interactive_add() -> None:
+    validate_configuration(require_local=True)
     hostname = choose_hostname_interactive()
     if not hostname:
         cprint("已取消", "yellow")
@@ -3028,6 +3064,7 @@ def interactive_add() -> None:
     add_accelerated_service(hostname, service)
 
 def interactive_remove() -> None:
+    validate_configuration(require_local=True)
     hostname = normalize_hostname(prompt("要删除的域名"))
     if not prompt_yes_no(f"确认删除 {hostname} 的隧道/SaaS/DNS？", False):
         cprint("已取消", "yellow")
@@ -3036,6 +3073,7 @@ def interactive_remove() -> None:
 
 
 def interactive_switch() -> None:
+    validate_configuration(require_local=False)
     hostname = normalize_hostname(prompt("要切换到优选的域名"))
     switch_to_preferred(hostname)
 
@@ -3226,6 +3264,10 @@ def print_help() -> None:
     print(
         f"cf-tunnel-accel {SCRIPT_VERSION}\n"
         '快速开始: cf-tunnel-accel init --help（生成自己的配置）\n'
+        '全局配置选择（放在命令之前）: --profile ID [--profiles /absolute/profiles.json]\n'
+        '  cf-tunnel-accel --profile alpha env     # 与 UI 的 alpha 配置相同\n'
+        '  cf-tunnel-accel --profile alpha add app.example.net 8080\n'
+        '无全局参数时可在默认 env 设置 CF_TUNNEL_ACCEL_PROFILE；不自动选第一个 profile。\n'
         '完整安装需同时保留 cfa_*.py 与 ui/；无个人基础设施默认值。\n'
         "用法:\n"
         "  cf-tunnel-accel                         # 交互菜单\n"
@@ -3532,6 +3574,8 @@ def main(argv: List[str]) -> int:
         print(f"cf-tunnel-accel {SCRIPT_VERSION}")
         return 0
     try:
+        if not cmd or cmd in ('add', 'del', 'delete', 'rm', 'switch'):
+            validate_configuration(require_local=(cmd != 'switch'))
         if command_requires_lock(argv):
             with exclusive_lock():
                 return _main_locked(argv)
@@ -3546,4 +3590,4 @@ def main(argv: List[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main(_CLI_ARGV))

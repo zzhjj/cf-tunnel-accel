@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / 'cf-tunnel-accel'
 
 
+# Global CLI selectors apply before the command; UI selectors remain after `ui`.
 def load_cli(env):
     with mock.patch.dict(os.environ, env, clear=True):
         name = 'config_contract_' + str(id(env))
@@ -90,6 +91,48 @@ class GenericConfiguration(unittest.TestCase):
             run.assert_not_called()
         self.assertFalse(cli.configuration_status()['ready'])
 
+    def test_add_cli_rejects_installer_scaffold_before_prompt_network_or_lock(self):
+        folder = self.home / '.config/cf-tunnel-accel'
+        folder.mkdir(parents=True)
+        (folder / 'token').write_text('fixture-only')
+        (folder / 'env').write_text('CF_TUNNEL_ACCEL_TOKEN_FILE=' + str(folder / 'token') + '\n')
+        config = self.home / '.cloudflared/config.yml'
+        config.parent.mkdir()
+        config.write_text('tunnel: 11111111-1111-1111-1111-111111111111\ningress:\n  - service: http_status:404\n')
+        for args in (['add'], ['add', 'example.org'], ['add', 'app.example.org', '18888']):
+            cli = load_cli(self.env)
+            messages = []
+            with mock.patch.object(cli, 'check_token') as token_check, \
+                    mock.patch.object(cli, 'exclusive_lock') as lock, \
+                    mock.patch.object(cli, 'api') as api, \
+                    mock.patch.object(cli, 'add_accelerated_service') as add, \
+                    mock.patch('builtins.input') as prompt, \
+                    mock.patch.object(cli, 'cprint', side_effect=lambda msg='', color=None: messages.append(str(msg))):
+                self.assertNotEqual(cli.main([str(CLI), *args]), 0)
+                prompt.assert_not_called()
+                token_check.assert_not_called()
+                lock.assert_not_called()
+                api.assert_not_called()
+                add.assert_not_called()
+            text = '\n'.join(messages)
+            self.assertIn('init', text)
+            self.assertIn(str(folder / 'env'), text)
+            self.assertNotIn('即将配置', text)
+            self.assertFalse(cli.LOCK_PATH.exists())
+
+
+    def test_interactive_add_prechecks_before_hostname_and_backend_prompts(self):
+        cli = load_cli(self.env)
+        with mock.patch.object(cli, 'choose_hostname_interactive') as pick, \
+                mock.patch.object(cli, 'api') as api, \
+                mock.patch('builtins.input') as prompt:
+            with self.assertRaises(cli.CFError):
+                cli.interactive_add()
+            pick.assert_not_called()
+            prompt.assert_not_called()
+            api.assert_not_called()
+
+
     def test_env_is_local_even_with_a_configured_token(self):
         cli = load_cli(dict(self.env, CF_API_TOKEN='fixture-only'))
         with mock.patch.object(cli, 'api', side_effect=AssertionError('env must stay offline')):
@@ -132,6 +175,15 @@ class GenericConfiguration(unittest.TestCase):
         with mock.patch.object(cli, 'api') as api, mock.patch('builtins.input', side_effect=AssertionError('no prompt')):
             self.assertNotEqual(cli.main([str(CLI), 'does-not-exist']), 0)
             api.assert_not_called()
+
+
+    def test_ui_launch_uses_the_immutable_cli_selection_environment(self):
+        cli = load_cli(dict(self.env, CF_TUNNEL_ACCEL_ENV_FILE=str(self.home / 'chosen.env')))
+        with mock.patch.object(cli, 'run', return_value=mock.Mock(stdout='inactive')), \
+                mock.patch.object(cli.subprocess, 'call', return_value=0) as launch, \
+                mock.patch.dict(os.environ, {'CF_TUNNEL_ACCEL_ENV_FILE': '/unrelated-live.env'}, clear=True):
+            self.assertEqual(cli.launch_ui(['--port', '0']), 0)
+        self.assertEqual(launch.call_args.kwargs['env']['CF_TUNNEL_ACCEL_ENV_FILE'], str(self.home / 'chosen.env'))
 
 
     def test_menu_reports_the_selected_config_not_a_private_fixture(self):

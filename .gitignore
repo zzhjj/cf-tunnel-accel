@@ -16,6 +16,9 @@ credentials*.json
 *.key
 .DS_Store
 
+# 本地 profile 注册表（仅仓库根目录，不屏蔽 docs 中的模板）
+/profiles.json
+
 # 本地 Docker 配置及 UI 状态（不屏蔽 docs 中的跟踪模板）
 /config/
 /data/

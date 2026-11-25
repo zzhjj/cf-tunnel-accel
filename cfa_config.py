@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -44,6 +45,124 @@ def read_env(path: Path, required: bool = False) -> dict[str, str]:
             value = value[1:-1]
         values.setdefault(key.strip(), value)
     return values
+
+
+
+_PROFILE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]*\Z')
+_PROFILE_REQUIRED = ('CF_TUNNEL_ACCEL_TUNNEL_ID', 'CF_TUNNEL_ACCEL_CONFIG',
+                     'CF_TUNNEL_ACCEL_SERVICE')
+
+
+def read_profile_registry(path: str | Path) -> list[dict[str, str]]:
+    """Read the administrator registry, using the same strict schema as ui/profiles.py."""
+    path = Path(path)
+    data = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(data, dict) or set(data) != {'profiles'}:
+        raise ValueError("registry must contain only 'profiles'")
+    entries = data['profiles']
+    if not isinstance(entries, list) or not entries:
+        raise ValueError('profiles must be a nonempty list')
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {'id', 'name', 'env_file'}:
+            raise ValueError('profile must contain only id, name, env_file')
+        if any(not isinstance(v, str) or not v.strip() for v in entry.values()):
+            raise ValueError('profile fields must be nonempty strings')
+        if not _PROFILE_ID.fullmatch(entry['id']):
+            raise ValueError("profile id must contain only letters, digits, '_' or '-'")
+        if entry['id'] in seen:
+            raise ValueError('duplicate profile id')
+        seen.add(entry['id'])
+        if not Path(entry['env_file']).is_absolute():
+            raise ValueError('profile env_file must be absolute')
+    return entries
+
+
+def merge_profile_environment(process: Mapping[str, str], entry: Mapping[str, str],
+                              values: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Merge only the selected file without mutating the process or reading tokens."""
+    path = Path(entry['env_file'])
+    if not path.is_absolute():
+        raise ValueError('profile env_file must be absolute')
+    if values is None:
+        try:
+            values = read_env(path, required=True)
+        except UnicodeError:
+            raise ValueError(f'profile env file is not UTF-8: {path}') from None
+    if any(not isinstance(values.get(key), str) or not values[key].strip()
+           for key in _PROFILE_REQUIRED):
+        raise ValueError('profile env file must explicitly set tunnel/config/service')
+    if not Path(values['CF_TUNNEL_ACCEL_CONFIG'].strip()).is_absolute():
+        raise ValueError('profile config must be an absolute path')
+    effective = dict(process)
+    # Explicit nonempty credential source wins as a group, matching UI profiles.
+    if any(str(values.get(key, '')).strip() for key in TOKEN_KEYS):
+        for key in TOKEN_KEYS:
+            effective.pop(key, None)
+    for key, value in values.items():
+        if key.startswith('CF_') or key == 'CLOUDFLARE_API_TOKEN' or key not in effective:
+            effective[key] = value
+    effective['CF_TUNNEL_ACCEL_ENV_FILE'] = str(path)
+    if process.get('CF_TUNNEL_ACCEL_RUNTIME') == 'container':
+        effective['CF_TUNNEL_ACCEL_RUNTIME'] = 'container'
+    return effective
+
+
+def select_cli_profile(environ: Mapping[str, str], argv: list[str]) -> tuple[dict, list, dict]:
+    """Normalize global profile flags in full sys.argv before resolving settings.
+
+    Parsing ends at the first non-profile argument, so ui --profiles remains a
+    subcommand option. Bootstrap configuration contributes selection markers only.
+    No registry is opened unless a profile/registry selection was requested.
+    """
+    process, normalized = dict(environ), list(argv)
+    flags = {}
+    index = 1  # Preserve argv[0], as required by the CLI main(argv) contract.
+    while index < len(normalized):
+        option, equals, inline = normalized[index].partition('=')
+        if option not in ('--profile', '--profiles'):
+            break
+        if option in flags:
+            raise ValueError(f'duplicate {option}')
+        if equals:
+            value, consumed = inline, 1
+        else:
+            if index + 1 >= len(normalized):
+                raise ValueError(f'missing value for {option}')
+            value, consumed = normalized[index + 1], 2
+        if not value.strip() or value.startswith('-') or any(c in value for c in '\r\n\x00'):
+            raise ValueError(f'invalid value for {option}')
+        if option == '--profile' and not _PROFILE_ID.fullmatch(value):
+            raise ValueError('invalid profile id')
+        flags[option] = value
+        del normalized[index:index + consumed]
+
+    home = Path(process.get('HOME') or Path.home()).expanduser()
+    config_dir = Path(process.get('CF_TUNNEL_ACCEL_CONFIG_DIR') or
+                      str(Path(process.get('XDG_CONFIG_HOME') or home / '.config') / 'cf-tunnel-accel')).expanduser()
+    bootstrap = Path(process.get('CF_TUNNEL_ACCEL_ENV_FILE') or config_dir / 'env').expanduser()
+    # Explicit process/flag selectors need no default-file read when complete.
+    profile_id = flags.get('--profile', process.get('CF_TUNNEL_ACCEL_PROFILE', ''))
+    registry = flags.get('--profiles', process.get('CF_TUNNEL_ACCEL_PROFILES', ''))
+    markers = read_env(bootstrap) if not profile_id or not registry else {}
+    profile_id = profile_id or markers.get('CF_TUNNEL_ACCEL_PROFILE', '')
+    registry = registry or markers.get('CF_TUNNEL_ACCEL_PROFILES', '')
+    if not profile_id and not registry:
+        return process, normalized, {}
+    if not profile_id:
+        raise ValueError('profile registry selection requires an explicit or marked profile id')
+    if not _PROFILE_ID.fullmatch(profile_id):
+        raise ValueError('invalid profile id')
+    if registry and (not registry.strip() or any(c in registry for c in '\r\n\x00')):
+        raise ValueError('invalid profile registry path')
+    registry_path = Path(registry).expanduser() if registry else config_dir / 'profiles.json'
+    entries = read_profile_registry(registry_path)
+    entry = next((entry for entry in entries if entry['id'] == profile_id), None)
+    if entry is None:
+        raise ValueError(f'unknown profile id: {profile_id}')
+    effective = merge_profile_environment(process, entry)
+    return effective, normalized, {'profile_id': entry['id'], 'name': entry['name'],
+                                   'registry': str(registry_path)}
 
 
 def resolve_settings(environ: Mapping[str, str]) -> dict:

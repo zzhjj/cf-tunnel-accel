@@ -16,58 +16,35 @@ not implemented. Default mode keeps the CLI's normal environment/file precedence
 
 from __future__ import annotations
 
+from functools import lru_cache
 import importlib.machinery
 import importlib.util
-import json
 import os
 from pathlib import Path
-import re
 import sys
 from types import ModuleType
 from uuid import uuid4
 
 
-_REQUIRED = (
-    "CF_TUNNEL_ACCEL_TUNNEL_ID",
-    "CF_TUNNEL_ACCEL_CONFIG",
-    "CF_TUNNEL_ACCEL_SERVICE",
-)
-_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+@lru_cache(maxsize=1)
+def _config_parser() -> ModuleType:
+    # Installed CLI packages may differ; always use the parser beside this UI.
+    parser_path = Path(__file__).resolve().parent.parent / 'cfa_config.py'
+    spec = importlib.util.spec_from_file_location('_cfa_profile_config', parser_path)
+    parser = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parser)
+    return parser
 
 
 def _registry(path: Path) -> list[dict[str, str]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) != {"profiles"}:
-        raise ValueError("registry must contain only 'profiles'")
-    entries = data["profiles"]
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("profiles must be a nonempty list")
-    seen = set()
-    for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"id", "name", "env_file"}:
-            raise ValueError("profile must contain only id, name, env_file")
-        if any(not isinstance(v, str) or not v.strip() for v in entry.values()):
-            raise ValueError("profile fields must be nonempty strings")
-        if not _ID.fullmatch(entry["id"]):
-            raise ValueError("profile id must contain only letters, digits, '_' or '-'")
-        if entry["id"] in seen:
-            raise ValueError("duplicate profile id")
-        seen.add(entry["id"])
-        if not Path(entry["env_file"]).is_absolute():
-            raise ValueError("profile env_file must be absolute")
-    return entries
+    return _config_parser().read_profile_registry(path)
 
 
 def _env_values(path: Path) -> dict[str, str]:
     # Keep exactly one parser for CLI and registry files; explicit selection is strict.
     if not path.exists():
         path.read_text(encoding='utf-8')  # Preserve actionable FileNotFoundError for explicit files.
-    import importlib.util
-    parser_path = Path(__file__).resolve().parent.parent / 'cfa_config.py'
-    spec = importlib.util.spec_from_file_location('_cfa_profile_config', parser_path)
-    parser = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(parser)
-    return parser.read_env(path, required=True)
+    return _config_parser().read_env(path, required=True)
 
 
 def _import_cli(path: Path) -> ModuleType:
@@ -111,8 +88,7 @@ def load_profiles(
             env = dict(baseline)
             if registry_path is not None:
                 values = _env_values(Path(entry["env_file"]))
-                if any(not values.get(key, "").strip() for key in _REQUIRED):
-                    raise ValueError("profile env file must explicitly set tunnel/config/service")
+                env = _config_parser().merge_profile_environment(baseline, entry, values=values)
                 config = Path(values["CF_TUNNEL_ACCEL_CONFIG"].strip()).resolve()
                 service = values["CF_TUNNEL_ACCEL_SERVICE"].strip()
                 # systemctl accepts both 'foo' and 'foo.service'.
@@ -121,19 +97,6 @@ def load_profiles(
                     raise ValueError("profiles must use distinct config paths and services")
                 configs.add(config)
                 services.add(service)
-                credential_keys = ('CF_TUNNEL_ACCEL_API_TOKEN', 'CF_API_TOKEN',
-                                   'CLOUDFLARE_API_TOKEN', 'CF_TUNNEL_ACCEL_TOKEN_FILE')
-                if any(values.get(key, '').strip() for key in credential_keys):
-                    # Explicit profile credential source wins as a group, including alias/file.
-                    for key in credential_keys:
-                        env.pop(key, None)
-                if not Path(values['CF_TUNNEL_ACCEL_CONFIG']).is_absolute():
-                    raise ValueError('profile config must be an absolute path')
-                for key, value in values.items():
-                    if key.startswith('CF_') or key == 'CLOUDFLARE_API_TOKEN' or key not in env:
-                        env[key] = value
-                # A file cannot redirect the CLI to a different env file.
-                env["CF_TUNNEL_ACCEL_ENV_FILE"] = entry["env_file"]
             # Container entrypoint is a process-level boundary, not a profile preference.
             if baseline.get('CF_TUNNEL_ACCEL_RUNTIME') == 'container':
                 env['CF_TUNNEL_ACCEL_RUNTIME'] = 'container'
